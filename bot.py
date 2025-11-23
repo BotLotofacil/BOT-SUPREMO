@@ -363,6 +363,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("meuid", meuid))
     app.add_handler(CommandHandler("gerar", gerar))
+    app.add_handler(CommandHandler("confirmar", confirmar))
 
     logger.info("Bot iniciado. Aguardando comandos...")
     app.run_polling(close_loop=False)
