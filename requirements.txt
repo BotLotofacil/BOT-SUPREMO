@@ -1,5 +1,1 @@
 python-telegram-bot==20.6
-pandas==2.2.2
-numpy==1.26.4
-scikit-learn==1.5.1
-python-dotenv==1.0.1
