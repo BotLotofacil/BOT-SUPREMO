@@ -26,7 +26,7 @@ logger = logging.getLogger("lotofacil_oraculo")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "COLOQUE_SEU_TOKEN_AQUI")
 TIMEZONE = os.environ.get("TZ", "America/Sao_Paulo")
-HISTORY_PATH = os.environ.get("HISTORY_PATH", "history.csv")
+HISTORY_PATH = os.environ.get("HISTORY_PATH", "data/history.csv")
 
 # Lista de usuários autorizados (string separada por vírgula)
 # Exemplo: ADMIN_IDS="123456789,987654321"
