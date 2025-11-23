@@ -281,6 +281,74 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(texto, parse_mode="HTML")
     else:
         await update.message.reply_text(texto, parse_mode="HTML")
+        
+
+# --------------------------------------------------------
+# /confirmar — registra o resultado oficial e aplica aprendizado
+# --------------------------------------------------------
+
+async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    user_id = user.id if user else 0
+
+    if not _usuario_autorizado(user_id):
+        return await update.message.reply_text("⛔ Você não está autorizado a usar este bot.")
+
+    # Anti flood
+    if _hit_cooldown(user_id, "confirmar", cooldown=4.0):
+        return await update.message.reply_text("⏳ Aguarde alguns segundos antes de usar /confirmar novamente.")
+
+    texto = update.message.text.strip().split()
+    dezenas_raw = texto[1:]  # tudo após /confirmar
+
+    # Validação das dezenas
+    try:
+        dezenas = [int(x) for x in dezenas_raw]
+    except:
+        return await update.message.reply_text("Use: /confirmar <15 dezenas entre 1..25>")
+
+    if len(dezenas) != 15 or any(d < 1 or d > 25 for d in dezenas):
+        return await update.message.reply_text("❗ Envie exatamente 15 dezenas entre 1–25.")
+
+    dezenas = sorted(dezenas)
+
+    # Carregar histórico
+    historico = carregar_historico(HISTORY_PATH)
+    ultimo = ultimo_resultado(historico)
+
+    # Aprendizado
+    learn = LearningCore()
+
+    # Aplica aprendizado real
+    try:
+        relatorio = learn.registrar_resultado_oficial(
+            resultado_oficial=dezenas,
+            ultimo_lote_base=ultimo
+        )
+    except Exception as e:
+        logger.error(f"Erro no aprendizado: {e}")
+        return await update.message.reply_text(f"Erro interno no aprendizado: {e}")
+
+    # Atualiza o arquivo history.csv
+    try:
+        import csv
+        with open(HISTORY_PATH, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([""] * 10 + dezenas)  # 10 colunas vazias + 15 dezenas
+    except Exception as e:
+        logger.error("Erro ao atualizar history.csv", exc_info=True)
+        return await update.message.reply_text(f"Erro ao atualizar histórico: {e}")
+
+    # Resposta elegante
+    msg = (
+        "✅ <b>Resultado oficial registrado com sucesso!</b>\n\n"
+        f"• Dezenas confirmadas: <b>{' '.join(f'{d:02d}' for d in dezenas)}</b>\n\n"
+        "<b>📘 Aprendizado aplicado:</b>\n"
+        f"{relatorio}\n\n"
+        "<i>O núcleo agora está atualizado e pronto para gerar novos lotes mais inteligentes.</i>"
+    )
+
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 # ---------------------------- bootstrap ----------------------------
