@@ -1,4 +1,3 @@
-# bot.py
 from __future__ import annotations
 import logging
 import os
@@ -32,6 +31,13 @@ HISTORY_PATH = os.environ.get("HISTORY_PATH", "data/history.csv")
 # Exemplo: ADMIN_IDS="123456789,987654321"
 ADMIN_IDS_ENV = os.environ.get("ADMIN_IDS", "")
 ADMIN_IDS = {int(x) for x in ADMIN_IDS_ENV.replace(" ", "").split(",") if x.isdigit()}
+
+# ------------------------ Estado em memória (/gerar -> /confirmar) ------------------------
+
+# Lote mais recente gerado pelo /gerar
+LAST_APOSTAS: List[List[int]] = []
+# Base (último resultado do history) usada para gerar esse lote
+LAST_BASE: List[int] = []
 
 
 # ------------------------ Helpers de histórico ------------------------
@@ -111,9 +117,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id if update.effective_user else 0
     msg = (
         "👋 Bem-vindo ao *LotoFácil Oráculo Supremo*.\n\n"
-        "Comando principal:\n"
-        "`/gerar` – gera suas apostas Mestre com base no último resultado.\n\n"
-        "Use `/meuid` para ver seu ID e configurar autorização."
+        "Comandos principais:\n"
+        "/gerar – gera suas apostas Mestre com base no último resultado do histórico.\n"
+        "/confirmar <15 dezenas> – aplica aprendizado sobre o último lote gerado.\n\n"
+        "Use /meuid para ver seu ID e configurar autorização."
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -140,7 +147,7 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if _hit_cooldown(user_id, "gerar"):
         return await update.message.reply_text(
-            f"⏳ Aguarde alguns segundos antes de usar /gerar novamente."
+            "⏳ Aguarde alguns segundos antes de usar /gerar novamente."
         )
 
     # Mensagem de carregamento
@@ -236,8 +243,13 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     melhor = max(placares)
     media = sum(placares) / len(placares)
 
-    # Registra lote como "gerado" (para histórico)
+    # Registra lote como "gerado" (para histórico leve de aprendizado)
     learn_core.registrar_lote_gerado(oficial_base=ultimo, apostas=apostas, tag="gerar")
+
+    # Salva lote e base em memória para o /confirmar
+    global LAST_APOSTAS, LAST_BASE
+    LAST_APOSTAS = [list(a) for a in apostas]
+    LAST_BASE = list(ultimo)
 
     await _set_progress(0.95, "Formatando resposta...")
 
@@ -281,10 +293,10 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(texto, parse_mode="HTML")
     else:
         await update.message.reply_text(texto, parse_mode="HTML")
-        
+
 
 # --------------------------------------------------------
-# /confirmar — registra o resultado oficial e aplica aprendizado
+# /confirmar — aplica aprendizado sobre o ÚLTIMO lote gerado
 # --------------------------------------------------------
 
 async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -294,17 +306,17 @@ async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _usuario_autorizado(user_id):
         return await update.message.reply_text("⛔ Você não está autorizado a usar este bot.")
 
-    # Anti flood
     if _hit_cooldown(user_id, "confirmar", cooldown=4.0):
-        return await update.message.reply_text("⏳ Aguarde alguns segundos antes de usar /confirmar novamente.")
+        return await update.message.reply_text(
+            "⏳ Aguarde alguns segundos antes de usar /confirmar novamente."
+        )
 
-    texto = update.message.text.strip().split()
-    dezenas_raw = texto[1:]  # tudo após /confirmar
+    partes = update.message.text.strip().split()
+    dezenas_raw = partes[1:]
 
-    # Validação das dezenas
     try:
         dezenas = [int(x) for x in dezenas_raw]
-    except:
+    except Exception:
         return await update.message.reply_text("Use: /confirmar <15 dezenas entre 1..25>")
 
     if len(dezenas) != 15 or any(d < 1 or d > 25 for d in dezenas):
@@ -312,47 +324,60 @@ async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     dezenas = sorted(dezenas)
 
-    # Carregar histórico
-    historico = carregar_historico(HISTORY_PATH)
-    ultimo = ultimo_resultado(historico)
-
-    # Aprendizado
-    learn = LearningCore()
-
-    # Aplica aprendizado real
-    try:
-        relatorio = learn.registrar_resultado_oficial(
-            resultado_oficial=dezenas,
-            ultimo_lote_base=ultimo
+    # Verifica se existe lote em memória
+    global LAST_APOSTAS, LAST_BASE
+    if not LAST_APOSTAS:
+        return await update.message.reply_text(
+            "⚠️ Ainda não há um lote em memória.\n"
+            "Use /gerar para produzir apostas e depois chame /confirmar com o resultado oficial."
         )
+
+    learn = LearningCore()
+    alpha_antes = learn.get_alpha()
+
+    try:
+        resumo = learn.aprender_com_lote(oficial=dezenas, apostas=LAST_APOSTAS, tag="confirmar")
     except Exception as e:
-        logger.error(f"Erro no aprendizado: {e}")
+        logger.error("Erro no aprendizado em /confirmar", exc_info=True)
         return await update.message.reply_text(f"Erro interno no aprendizado: {e}")
 
-    # Atualiza o arquivo history.csv
-    try:
-        import csv
-        with open(HISTORY_PATH, "a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow([""] * 10 + dezenas)  # 10 colunas vazias + 15 dezenas
-    except Exception as e:
-        logger.error("Erro ao atualizar history.csv", exc_info=True)
-        return await update.message.reply_text(f"Erro ao atualizar histórico: {e}")
+    alpha_depois = resumo.get("alpha", alpha_antes)
+    media = resumo.get("media", 0.0)
+    topk = resumo.get("topk", 0.0)
+    melhor = resumo.get("melhor", 0)
+    lote_bom = resumo.get("lote_bom", False)
 
-    # Resposta elegante
-    msg = (
-        "✅ <b>Resultado oficial registrado com sucesso!</b>\n\n"
-        f"• Dezenas confirmadas: <b>{' '.join(f'{d:02d}' for d in dezenas)}</b>\n\n"
-        "<b>📘 Aprendizado aplicado:</b>\n"
-        f"{relatorio}\n\n"
-        "<i>O núcleo agora está atualizado e pronto para gerar novos lotes mais inteligentes.</i>"
+    status = "✅ Lote considerado BOM para aprendizado." if lote_bom else "ℹ️ Lote fraco: ajuste suave aplicado."
+
+    msg = [
+        "✅ <b>Resultado analisado com sucesso!</b>\n",
+        f"• Resultado informado: <b>{' '.join(f'{d:02d}' for d in dezenas)}</b>\n",
+        "<b>📊 Aprendizado aplicado sobre o ÚLTIMO lote gerado:</b>",
+        f"• Melhor aposta: <b>{melhor}</b> acertos",
+        f"• Média do lote: <b>{media:.2f}</b> acertos",
+        f"• Top-K médio: <b>{topk:.2f}</b> acertos",
+        "",
+        f"• Alpha antes: <b>{alpha_antes:.3f}</b>",
+        f"• Alpha depois: <b>{alpha_depois:.3f}</b>",
+        "",
+        status,
+    ]
+
+    if LAST_BASE:
+        msg.append(
+            "\n<b>Base usada no último /gerar:</b> "
+            + " ".join(f"{d:02d}" for d in LAST_BASE)
+        )
+
+    msg.append(
+        "\n<i>O histórico de resultados (history.csv) não foi alterado; "
+        "atualize-o manualmente como de costume.</i>"
     )
 
-    await update.message.reply_text(msg, parse_mode="HTML")
+    await update.message.reply_text("\n".join(msg), parse_mode="HTML")
 
 
 # ---------------------------- bootstrap ----------------------------
-
 
 def main() -> None:
     if not BOT_TOKEN or BOT_TOKEN == "COLOQUE_SEU_TOKEN_AQUI":
