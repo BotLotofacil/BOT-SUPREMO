@@ -29,12 +29,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "COLOQUE_SEU_TOKEN_AQUI")
 TIMEZONE = os.environ.get("TZ", "America/Sao_Paulo")
 HISTORY_PATH = os.environ.get("HISTORY_PATH", "data/history.csv")
 
-# Lista de usuários administradores (string separada por vírgula)
-# Exemplo: ADMIN_IDS="123456789,987654321"
-ADMIN_IDS_ENV = os.environ.get("ADMIN_IDS", "")
-ADMIN_IDS: Set[int] = {
-    int(x) for x in ADMIN_IDS_ENV.replace(" ", "").split(",") if x.isdigit()
-}
+# Admin fixo (não depende de variável de ambiente)
+# Somente este ID terá acesso aos comandos administrativos
+ADMIN_IDS: Set[int] = {5344741474}
 
 # Caminho da whitelist de clientes pagantes (1 ID por linha)
 WHITELIST_PATH = os.environ.get("WHITELIST_PATH", "whitelist.txt")
@@ -97,11 +94,8 @@ def _hit_cooldown(user_id: int, comando: str, cooldown: float = COOLDOWN_SECONDS
 def _is_admin(user_id: int) -> bool:
     """
     Retorna True se o usuário é administrador.
-    - Se ADMIN_IDS estiver vazio, considera todos como admin (modo desenvolvimento).
-    - Em produção, configure ADMIN_IDS com seu ID para restringir.
+    Admin é definido fixo em ADMIN_IDS.
     """
-    if not ADMIN_IDS:
-        return True
     return user_id in ADMIN_IDS
 
 
