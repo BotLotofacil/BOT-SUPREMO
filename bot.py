@@ -42,28 +42,48 @@ LAST_BASE: List[int] = []
 
 # ------------------------ Helpers de histórico ------------------------
 
-
 def carregar_historico(path: str) -> List[List[int]]:
     """
-    Carrega um history.csv simples:
-    - Supõe cabeçalho na primeira linha
-    - Cada linha tem pelo menos 15 dezenas nas 15 últimas colunas
+    Carrega um history.csv simples, sem assumir forma fixa:
+    - Se a primeira linha NÃO for dezenas válidas (1–25), trata como cabeçalho
+    - Caso contrário, considera que já é um resultado
+    - Cada linha deve ter pelo menos 15 colunas; usamos sempre as 15 últimas
     """
     import csv
+    import os
 
     if not os.path.exists(path):
         return []
-    hist = []
+
+    hist: List[List[int]] = []
+
     with open(path, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
-        rows = list(reader)
+        rows = [row for row in reader if row]  # ignora linhas totalmente vazias
+
     if not rows:
         return []
-    # ignora cabeçalho
-    for row in rows[1:]:
+
+    def linha_eh_dezenas(row: List[str]) -> bool:
+        """Retorna True se a linha parecer ser um resultado válido da Lotofácil."""
+        if len(row) < 15:
+            return False
+        dezenas_raw = row[-15:]
+        try:
+            dezenas = [int(x) for x in dezenas_raw]
+        except Exception:
+            return False
+        return all(1 <= d <= 25 for d in dezenas)
+
+    # Detecta se a primeira linha é cabeçalho ou já é um resultado
+    start_idx = 0
+    if not linha_eh_dezenas(rows[0]):
+        # primeira linha é cabeçalho → começamos da linha 2
+        start_idx = 1
+
+    for row in rows[start_idx:]:
         if len(row) < 15:
             continue
-        # pega as 15 últimas colunas como dezenas
         dezenas_raw = row[-15:]
         try:
             dezenas = [int(x) for x in dezenas_raw]
@@ -73,13 +93,19 @@ def carregar_historico(path: str) -> List[List[int]]:
         if len(dezenas) == 15:
             dezenas = sorted(dezenas)
             hist.append(dezenas)
+
     return hist
 
 
 def ultimo_resultado(historico: List[List[int]]) -> List[int]:
+    """
+    Considera que o arquivo está com o ÚLTIMO concurso na PRIMEIRA linha de dados.
+    Ou seja: historico[0] = último resultado real.
+    """
     if not historico:
         return []
-    return list(sorted(historico[-1]))
+    # já vem ordenado em carregar_historico, mas mantemos para garantir
+    return list(sorted(historico[0]))
 
 
 # ------------------------ Helpers de autorização ------------------------
