@@ -31,7 +31,7 @@ HISTORY_PATH = os.environ.get("HISTORY_PATH", "data/history.csv")
 
 # Admin fixo (não depende de variável de ambiente)
 # Somente este ID terá acesso aos comandos administrativos
-ADMIN_IDS: Set[int] = {5344741474}
+ADMIN_IDS: Set[int] = {5344714174}
 
 # Caminho da whitelist de clientes pagantes (1 ID por linha)
 WHITELIST_PATH = os.environ.get("WHITELIST_PATH", "whitelist.txt")
