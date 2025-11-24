@@ -248,21 +248,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     uid = user.id if user else 0
 
-    # Mensagem diferente para admin x usuário comum
     if _is_admin(uid):
         msg = (
-            "👋 Bem-vindo ao *LotoFácil Oráculo Supremo*.\n\n"
+            "👋 Bem-vindo ao <b>LotoFácil Oráculo Supremo</b>.\n\n"
             "Comandos principais:\n"
             "/gerar – gera suas apostas Mestre com base no último resultado do histórico.\n"
-            "/confirmar <15 dezenas> – aplica aprendizado sobre o último lote gerado (ADMIN).\n"
-            "/desbloquear <id> – remove bloqueio de um usuário (ADMIN).\n"
+            "/confirmar &lt;15 dezenas&gt; – aplica aprendizado sobre o último lote gerado (ADMIN).\n"
+            "/desbloquear &lt;id&gt; – remove bloqueio de um usuário (ADMIN).\n"
             "/lista_bloqueados – lista todos os usuários bloqueados (ADMIN).\n"
             "/meuid – mostra seu ID.\n\n"
             "Use com responsabilidade."
         )
     else:
         msg = (
-            "👋 Bem-vindo ao *LotoFácil Oráculo Supremo*.\n\n"
+            "👋 Bem-vindo ao <b>LotoFácil Oráculo Supremo</b>.\n\n"
             "Comandos disponíveis para você:\n"
             "/gerar – gera suas apostas Mestre com base no último resultado do histórico.\n"
             "/meuid – mostra seu ID.\n\n"
@@ -271,7 +270,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "O bot é focado apenas em comandos. Após 3 avisos, seu acesso será bloqueado."
         )
 
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 async def meuid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
