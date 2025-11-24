@@ -6,7 +6,6 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from typing import List, Dict, Tuple
-import math
 
 N_UNIVERSO = 25
 N_DEZENAS = 15
@@ -50,10 +49,17 @@ def clamp(v: float, vmin: float, vmax: float) -> float:
 
 @dataclass
 class EngineConfig:
+    # anti-overlap entre apostas
     overlap_max: int = OVERLAP_MAX_DEFAULT
-    target_qtd: int = 15
-    # peso base da repetição R (quantidade de dezenas repetidas do último resultado)
-    base_R_plan: Tuple[int, ...] = (10, 9, 9, 10, 10, 9, 10, 8, 11, 11, 10, 9, 11, 8, 10)
+    # alvo de quantidade de apostas no lote (Preset Mestre => 10)
+    target_qtd: int = 10
+    # plano base de repetição R (quantidade de dezenas repetidas do último resultado)
+    # Usado ciclicamente conforme o índice da aposta no lote.
+    base_R_plan: Tuple[int, ...] = (
+        10, 9, 9, 10, 10,
+        9, 10, 8, 11, 11,
+        10, 9, 11, 8, 10,
+    )
 
 
 class OraculoEngine:
@@ -63,6 +69,7 @@ class OraculoEngine:
     - Usa plano de repetição R (9R–10R alvo, com 8R e 11R para variação)
     - Aplica vieses de dezenas (bias_num)
     - Enforça shape Mestre e anti-overlap
+    - Sempre mira EXACT target_qtd apostas; se não conseguir, lança exceção.
     """
 
     def __init__(
@@ -72,12 +79,16 @@ class OraculoEngine:
         alpha: float = 0.36,
     ) -> None:
         self.config = config or EngineConfig()
-        # bias_num: 1..25 -> peso (0.0 ~ 1.0+)
+        # bias_num: 1..25 -> peso (faixa suave, ex.: [-3, +3] convertido em pesos positivos)
         self.bias_num: Dict[int, float] = {i: 0.0 for i in range(1, N_UNIVERSO + 1)}
         if bias_num:
             for k, v in bias_num.items():
-                if 1 <= int(k) <= N_UNIVERSO:
-                    self.bias_num[int(k)] = float(v)
+                try:
+                    idx = int(k)
+                    if 1 <= idx <= N_UNIVERSO:
+                        self.bias_num[idx] = float(v)
+                except Exception:
+                    continue
         self.alpha = float(alpha)
 
     # ------------------------- Helpers internos -------------------------
@@ -87,7 +98,7 @@ class OraculoEngine:
         pesos = []
         for d in dezenas:
             b = self.bias_num.get(d, 0.0)
-            # mapeia bias [-5, +5] para peso [0.5, 2.0] (exemplo)
+            # bias em [-3, +3] → mapeia para algo em torno de [~0.55, ~1.45]
             w = 1.0 + 0.15 * b
             if w < 0.1:
                 w = 0.1
@@ -141,7 +152,6 @@ class OraculoEngine:
         aposta = sorted(set(aposta))
         if len(aposta) != N_DEZENAS:
             return aposta
-        pares, imp = paridade(aposta)
         universo = list(range(1, N_UNIVERSO + 1))
         fora = [n for n in universo if n not in aposta]
 
@@ -149,15 +159,9 @@ class OraculoEngine:
         for _ in range(4):
             if max_seq(aposta) <= 3:
                 break
-            # escolhe um número de uma sequência longa para retirar
-            seq_atual_max = max_seq(aposta)
-            if seq_atual_max <= 3:
-                break
-            # remove um número aleatório da aposta
             idx_remove = rng.randrange(len(aposta))
             rem = aposta[idx_remove]
             aposta.pop(idx_remove)
-            # adiciona algum número de fora
             if fora:
                 add = rng.choice(fora)
                 fora.remove(add)
@@ -169,7 +173,6 @@ class OraculoEngine:
         for _ in range(4):
             if 7 <= pares <= 8 and max_seq(aposta) <= 3:
                 break
-            # se tem pares demais, troca um par por um ímpar de fora, e vice-versa
             if pares > 8:
                 candidatos = [d for d in aposta if d % 2 == 0]
                 if not candidatos or not fora:
@@ -179,7 +182,6 @@ class OraculoEngine:
                 fora.append(rem)
                 imp_candidates = [x for x in fora if x % 2 == 1]
                 if not imp_candidates:
-                    # volta
                     aposta.append(rem)
                     fora.remove(rem)
                     break
@@ -218,11 +220,16 @@ class OraculoEngine:
     ) -> List[List[int]]:
         """
         Gera um lote de apostas:
-        - Usa plano de repetição R, com viés leve por alpha/bias se desejar
+        - Usa plano de repetição R, com viés leve por alpha/bias
         - Enforça shape Mestre e anti-overlap
+        - Mira EXACT qtd apostas (default = config.target_qtd).
+          Se não conseguir respeitando todas as regras, lança RuntimeError.
         """
         if qtd is None:
             qtd = self.config.target_qtd
+        qtd = int(qtd)
+        if qtd <= 0:
+            raise ValueError("qtd inválida para gerar_lote.")
 
         # Normaliza último resultado
         L = sorted(set(int(x) for x in ultimo_resultado if 1 <= int(x) <= N_UNIVERSO))
@@ -232,47 +239,47 @@ class OraculoEngine:
         universo = list(range(1, N_UNIVERSO + 1))
         C = [n for n in universo if n not in L]
 
-        r = random.Random(seed)
+        rng = random.Random(seed)
 
-        # Plano de repetição R (podemos “puxar” para 10R com alpha)
+        # Plano de repetição R (cíclico) com leve viés por alpha
         base_R = list(self.config.base_R_plan)
         plano_R: List[int] = []
         for i in range(qtd):
-            # leve ajuste: quanto maior alpha, maior viés para 10R/11R
             idx = i % len(base_R)
             val = base_R[idx]
+            # leve ajuste: quanto maior alpha, maior viés para 10R/11R
             if self.alpha > 0.35:
-                if val == 9 and r.random() < (self.alpha - 0.35):
+                if val == 9 and rng.random() < (self.alpha - 0.35):
                     val = 10
-                if val == 10 and r.random() < (self.alpha - 0.35) / 2:
+                if val == 10 and rng.random() < (self.alpha - 0.35) / 2.0:
                     val = 11
             plano_R.append(val)
 
         apostas: List[List[int]] = []
+        tentativas = 0
+        max_tentativas = max(qtd * 20, 200)  # bem generoso para garantir o lote
 
-        # Geração com controle de overlap
-        for i in range(qtd * 4):  # limite de tentativas
-            if len(apostas) >= qtd:
-                break
+        while len(apostas) < qtd and tentativas < max_tentativas:
+            tentativas += 1
 
-            R_target = plano_R[len(apostas)]
+            idx_lote = len(apostas)
+            R_target = plano_R[idx_lote]
             R_target = max(6, min(13, R_target))  # segurança
 
             # escolha ponderada com bias
-            from_last = self._sample_weighted(r, L, R_target)
-            from_comp = self._sample_weighted(r, C, N_DEZENAS - len(from_last))
+            from_last = self._sample_weighted(rng, L, R_target)
+            from_comp = self._sample_weighted(rng, C, N_DEZENAS - len(from_last))
             aposta = sorted(set(from_last + from_comp))
 
             # segurança de tamanho
             if len(aposta) < N_DEZENAS:
-                # completa randomicamente do universo
                 faltam = N_DEZENAS - len(aposta)
                 pool = [n for n in universo if n not in aposta]
-                r.shuffle(pool)
+                rng.shuffle(pool)
                 aposta.extend(pool[:faltam])
                 aposta = sorted(set(aposta))
 
-            aposta = self._ajustar_shape_local(r, aposta)
+            aposta = self._ajustar_shape_local(rng, aposta)
 
             # shape Mestre
             if not shape_ok_mestre(aposta):
@@ -293,5 +300,12 @@ class OraculoEngine:
 
             apostas.append(sorted(aposta))
 
-        # Se, por algum motivo, veio menos que o alvo, apenas retorna o que conseguiu.
+        if len(apostas) < qtd:
+            # Preferimos falhar explicitamente a devolver menos apostas que o preset.
+            raise RuntimeError(
+                f"Falha ao gerar lote Mestre com {qtd} apostas dentro das regras "
+                f"(shape Mestre + anti-overlap≤{self.config.overlap_max}). "
+                f"Gerei apenas {len(apostas)} apostas em {tentativas} tentativas."
+            )
+
         return [sorted(a) for a in apostas]
