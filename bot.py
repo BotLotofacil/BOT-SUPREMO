@@ -36,6 +36,33 @@ ADMIN_IDS: Set[int] = {
     int(x) for x in ADMIN_IDS_ENV.replace(" ", "").split(",") if x.isdigit()
 }
 
+# Caminho da whitelist de clientes pagantes (1 ID por linha)
+WHITELIST_PATH = os.environ.get("WHITELIST_PATH", "whitelist.txt")
+
+
+def carregar_whitelist(path: str) -> Set[int]:
+    """
+    Carrega whitelist.txt:
+    - 1 ID numérico por linha
+    - Ignora linhas vazias ou não numéricas
+    """
+    ids: Set[int] = set()
+    if not os.path.exists(path):
+        return ids
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for linha in f:
+                s = linha.strip()
+                if s.isdigit():
+                    ids.add(int(s))
+    except Exception as e:
+        logger.error(f"Erro ao carregar whitelist de {path}: {e}", exc_info=True)
+    return ids
+
+
+# Conjunto de usuários liberados (clientes pagantes)
+WHITELIST_IDS: Set[int] = carregar_whitelist(WHITELIST_PATH)
+
 # ------------------------ Estado em memória (/gerar -> /confirmar) ------------------------
 
 # Lote mais recente gerado pelo /gerar
@@ -86,11 +113,24 @@ def _usuario_autorizado(user_id: int) -> bool:
     """
     Autorização geral para uso do bot:
     - Usuário NÃO pode estar bloqueado.
-    - Não exige ser admin (para /gerar).
+    - Admin sempre é autorizado.
+    - Se WHITELIST_IDS estiver vazia → modo aberto (teste).
+    - Se WHITELIST_IDS tiver IDs → só quem estiver nela pode usar.
     """
+    # Bloqueado nunca entra
     if _is_blocked(user_id):
         return False
-    return True
+
+    # Admin sempre pode
+    if _is_admin(user_id):
+        return True
+
+    # Se whitelist estiver vazia, consideramos modo aberto (desenvolvimento/teste)
+    if not WHITELIST_IDS:
+        return True
+
+    # Em produção: somente IDs presentes na whitelist.txt
+    return user_id in WHITELIST_IDS
 
 
 async def _registrar_infracao(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -222,6 +262,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/gerar – gera suas apostas Mestre com base no último resultado do histórico.\n"
             "/confirmar <15 dezenas> – aplica aprendizado sobre o último lote gerado (ADMIN).\n"
             "/desbloquear <id> – remove bloqueio de um usuário (ADMIN).\n"
+            "/lista_bloqueados – lista todos os usuários bloqueados (ADMIN).\n"
             "/meuid – mostra seu ID.\n\n"
             "Use com responsabilidade."
         )
@@ -231,6 +272,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Comandos disponíveis para você:\n"
             "/gerar – gera suas apostas Mestre com base no último resultado do histórico.\n"
             "/meuid – mostra seu ID.\n\n"
+            "Após a compra, envie o ID exibido em /meuid para o administrador liberar seu acesso.\n\n"
             "⚠️ Não envie mensagens de texto aleatórias, fotos, áudios ou outros tipos de mídia.\n"
             "O bot é focado apenas em comandos. Após 3 avisos, seu acesso será bloqueado."
         )
@@ -263,9 +305,13 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Apenas o administrador pode reverter esse bloqueio."
         )
 
-    # Para /gerar, não exigimos admin — apenas não pode estar bloqueado
+    # Autorização (whitelist + admin + bloqueio)
     if not _usuario_autorizado(user_id):
-        return await update.message.reply_text("⛔ Você não está autorizado a usar este bot.")
+        return await update.message.reply_text(
+            "⛔ Seu acesso ainda não está liberado.\n\n"
+            "Use /meuid e envie o seu ID para o administrador após a confirmação de pagamento.\n"
+            "Assim que seu ID for incluído na whitelist, o comando /gerar ficará disponível."
+        )
 
     if _hit_cooldown(user_id, "gerar"):
         return await update.message.reply_text(
@@ -565,6 +611,29 @@ async def desbloquear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # --------------------------------------------------------
+# /lista_bloqueados — ADMIN lista todos os usuários bloqueados
+# --------------------------------------------------------
+
+async def lista_bloqueados(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    user_id = user.id if user else 0
+
+    if not _is_admin(user_id):
+        return await update.message.reply_text("⛔ Este comando é restrito ao administrador.")
+
+    if not BLOCKED_USERS:
+        return await update.message.reply_text("✅ Não há usuários bloqueados no momento.")
+
+    linhas: List[str] = ["🚫 <b>Usuários bloqueados atualmente:</b>"]
+    for uid in sorted(BLOCKED_USERS):
+        avisos = WARNINGS.get(uid, 0)
+        linhas.append(f"• ID: <code>{uid}</code> | Avisos: {avisos}")
+
+    msg = "\n".join(linhas)
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
+# --------------------------------------------------------
 # Handler genérico para qualquer conteúdo não-comando
 # (texto solto, foto, vídeo, documento, áudio, sticker, etc.)
 # --------------------------------------------------------
@@ -579,6 +648,11 @@ def main() -> None:
     if not BOT_TOKEN or BOT_TOKEN == "COLOQUE_SEU_TOKEN_AQUI":
         raise RuntimeError("Defina BOT_TOKEN no ambiente ou dentro do bot.py antes de rodar.")
 
+    # Recarrega whitelist no início (caso o arquivo tenha mudado entre deploys)
+    global WHITELIST_IDS
+    WHITELIST_IDS = carregar_whitelist(WHITELIST_PATH)
+    logger.info(f"Whitelist carregada: {sorted(WHITELIST_IDS)}")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Comandos
@@ -587,6 +661,7 @@ def main() -> None:
     app.add_handler(CommandHandler("gerar", gerar))
     app.add_handler(CommandHandler("confirmar", confirmar))
     app.add_handler(CommandHandler("desbloquear", desbloquear))
+    app.add_handler(CommandHandler("lista_bloqueados", lista_bloqueados))
 
     # Qualquer mensagem que NÃO seja comando cai aqui (segurança máxima)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, anti_abuso_handler))
