@@ -161,7 +161,7 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     Comando SUPREMO:
     - Carrega último resultado do histórico
     - Carrega estado de aprendizado (bias_num + alpha)
-    - Gera 15 apostas conforme OraculoEngine
+    - Gera EXACT 10 apostas conforme OraculoEngine (Preset Mestre)
     - Exibe shape + estatísticas
     """
     user = update.effective_user
@@ -228,14 +228,15 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     alpha = learn_core.get_alpha()
     bias_num = learn_core.get_bias_num()
 
-    # Oráculo configurado
-    cfg = EngineConfig(overlap_max=11, target_qtd=15)
+    # Oráculo configurado: overlap=11, target_qtd=10 (Preset Mestre)
+    cfg = EngineConfig(overlap_max=11, target_qtd=10)
     engine = OraculoEngine(config=cfg, bias_num=bias_num, alpha=alpha)
 
     await _set_progress(0.55, "Gerando lote de apostas...")
 
     try:
-        apostas = engine.gerar_lote(ultimo_resultado=ultimo, qtd=15)
+        # Sempre pedimos EXACT 10 apostas
+        apostas = engine.gerar_lote(ultimo_resultado=ultimo, qtd=10)
     except Exception as e:
         logger.error("Erro no OraculoEngine.gerar_lote: %s", e, exc_info=True)
         if loading is not None:
@@ -245,13 +246,15 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
         return await update.message.reply_text(f"Erro interno ao gerar apostas: {e}")
 
-    if not apostas:
+    if not apostas or len(apostas) != 10:
         if loading is not None:
             try:
-                await loading.edit_text("Não foi possível gerar apostas válidas.")
+                await loading.edit_text("Não foi possível gerar as 10 apostas Mestre dentro das regras.")
             except Exception:
                 pass
-        return await update.message.reply_text("Não foi possível gerar apostas válidas.")
+        return await update.message.reply_text(
+            "Não foi possível gerar as 10 apostas Mestre dentro das regras (shape + anti-overlap)."
+        )
 
     await _set_progress(0.75, "Calculando telemetria...")
 
