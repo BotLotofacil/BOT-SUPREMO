@@ -1,9 +1,8 @@
-# learning.py
 from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, asdict, field
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 from datetime import datetime
 
 STATE_PATH_DEFAULT = os.environ.get("LEARN_STATE_PATH", "learn_state.json")
@@ -28,17 +27,26 @@ def _hits_media_topk(placares: List[int], k: int = 5) -> float:
 
 @dataclass
 class LearnConfig:
+    # Alpha com movimento suave
     alpha_min: float = 0.30
     alpha_max: float = 0.50
     alpha_init: float = 0.36
-    janela: int = 60
-    # thresholds
-    media_ok: float = 11.0     # média alvo
-    topk_ok: float = 12.0      # top-k médio alvo
-    # deltas
-    bias_hit_delta: float = 0.35
-    bias_miss_delta: float = -0.20
-    alpha_up: float = 0.01
+
+    # Memória REAL (quantos concursos recentes entram no cálculo)
+    janela: int = 50
+
+    # referencial inicial (usado só no comecinho, até ter histórico)
+    media_ref: float = 9.8
+    topk_ref: float = 11.0
+
+    # Bias em faixa suave [-3 .. +3]
+    bias_min: float = -3.0
+    bias_max: float = 3.0
+    bias_hit_delta: float = 0.20   # reforço quando lote é realmente bom
+    bias_miss_delta: float = -0.10 # penalização leve
+
+    # Movimentos de alpha bem suaves
+    alpha_up: float = 0.005
     alpha_down: float = -0.005
 
 
@@ -62,10 +70,10 @@ class LearnState:
 
 class LearningCore:
     """
-    Núcleo de aprendizado robusto:
+    Núcleo de aprendizado REAL:
     - Mantém alpha, janela e bias_num
-    - Aplica reforço apenas quando lote é realmente bom
-    - Penaliza levemente lotes ruins
+    - Usa memória de até 50 concursos (history)
+    - Gating baseado em desempenho relativo (média/top-k vs histórico)
     """
 
     def __init__(self, path: str = STATE_PATH_DEFAULT, cfg: LearnConfig | None = None) -> None:
@@ -86,18 +94,23 @@ class LearningCore:
 
         alpha = float(raw.get("alpha", self.cfg.alpha_init))
         janela = int(raw.get("janela", self.cfg.janela))
+
         bias_raw = raw.get("bias_num", {}) or {}
-        bias = {int(k): float(v) for k, v in bias_raw.items() if str(k).isdigit()}
+        bias: Dict[int, float] = {}
+        for k, v in bias_raw.items():
+            if str(k).isdigit():
+                idx = int(k)
+                if 1 <= idx <= N_UNIVERSO:
+                    bias[idx] = _clamp(float(v), self.cfg.bias_min, self.cfg.bias_max)
+
+        # completa quaisquer dezenas que não apareceram
+        for i in range(1, N_UNIVERSO + 1):
+            bias.setdefault(i, 0.0)
 
         hist = raw.get("history", []) or []
-        # garante que não exploda em tamanho
         hist = hist[-self.cfg.janela :]
 
-        st = LearnState(alpha=alpha, janela=janela, bias_num=bias, history=hist)
-        # completa dezena faltante
-        for i in range(1, N_UNIVERSO + 1):
-            st.bias_num.setdefault(i, 0.0)
-        return st
+        return LearnState(alpha=alpha, janela=janela, bias_num=bias, history=hist)
 
     def _salvar(self) -> None:
         raw = asdict(self.state)
@@ -123,7 +136,7 @@ class LearningCore:
     ) -> None:
         """
         Apenas registra que um lote foi gerado (para histórico e auditoria).
-        Não move bias aqui; o ajuste real acontece em aprender_com_lote.
+        O ajuste real acontece em aprender_com_lote.
         """
         rec = {
             "ts": datetime.utcnow().isoformat() + "Z",
@@ -135,6 +148,21 @@ class LearningCore:
         self.state.history = self.state.history[-self.cfg.janela :]
         self._salvar()
 
+    def _estatisticas_historicas(self) -> tuple[float | None, float | None]:
+        """Retorna (media_hist, topk_hist) usando apenas entradas com métricas."""
+        medias = []
+        topks = []
+        for rec in self.state.history:
+            if isinstance(rec, dict) and "media" in rec and "topk" in rec:
+                try:
+                    medias.append(float(rec["media"]))
+                    topks.append(float(rec["topk"]))
+                except Exception:
+                    continue
+        media_hist = sum(medias) / len(medias) if medias else None
+        topk_hist = sum(topks) / len(topks) if topks else None
+        return media_hist, topk_hist
+
     def aprender_com_lote(
         self,
         oficial: List[int],
@@ -143,10 +171,13 @@ class LearningCore:
     ) -> Dict[str, Any]:
         """
         Avalia o lote com o resultado oficial e atualiza:
-        - bias_num
-        - alpha
+        - bias_num (dezena a dezena)
+        - alpha (força de repetição)
 
-        Retorna um resumo com métricas para exibir no bot.
+        Usa memória de até 50 concursos para decidir se o lote é:
+        - "forte" (acima do histórico) → reforça
+        - "fraco" (abaixo do histórico) → corrige
+        - "neutro" → ajustes mínimos
         """
         oficial = sorted(set(int(x) for x in oficial if 1 <= int(x) <= N_UNIVERSO))
         if len(oficial) != N_DEZENAS:
@@ -157,15 +188,37 @@ class LearningCore:
         topk = _hits_media_topk(placares, k=min(5, len(placares))) if placares else 0.0
         melhor = max(placares) if placares else 0
 
-        # Gating: só reforça forte quando o lote é bom
-        lote_bom = (media >= self.cfg.media_ok) or (topk >= self.cfg.topk_ok)
+        # Estatísticas históricas (memória REAL)
+        media_hist, topk_hist = self._estatisticas_historicas()
 
-        # Atualiza bias_num
+        lote_bom = False
+        lote_ruim = False
+
+        if media_hist is not None and topk_hist is not None:
+            # Comparação relativa: quanto este lote ficou acima/abaixo da média histórica
+            delta_m = media - media_hist
+            delta_t = topk - topk_hist
+
+            # Gating suave
+            if delta_m >= 0.4 or delta_t >= 0.6:
+                lote_bom = True
+            elif delta_m <= -0.4 and delta_t <= -0.6:
+                lote_ruim = True
+        else:
+            # Ainda não temos histórico suficiente → usa thresholds de referência
+            if media >= self.cfg.media_ref or topk >= self.cfg.topk_ref:
+                lote_bom = True
+            elif media <= (self.cfg.media_ref - 0.8) and topk <= (self.cfg.topk_ref - 1.0):
+                lote_ruim = True
+
+        # ------------------------ Atualiza bias_num ------------------------
+
         if lote_bom:
             # reforça dezenas presentes nos melhores bilhetes E no oficial
             sorted_idx = sorted(range(len(placares)), key=lambda i: placares[i], reverse=True)
             k_top = max(1, min(5, len(sorted_idx)))
             idx_top = sorted_idx[:k_top]
+
             count_num: Dict[int, int] = {i: 0 for i in range(1, N_UNIVERSO + 1)}
             for i in idx_top:
                 for d in apostas[i]:
@@ -174,45 +227,57 @@ class LearningCore:
 
             for d in range(1, N_UNIVERSO + 1):
                 if d in oficial and count_num.get(d, 0) > 0:
-                    self.state.bias_num[d] = _clamp(
-                        self.state.bias_num.get(d, 0.0) + self.cfg.bias_hit_delta,
-                        -5.0,
-                        5.0,
-                    )
+                    # reforço suave positivo
+                    novo = self.state.bias_num.get(d, 0.0) + self.cfg.bias_hit_delta
+                    self.state.bias_num[d] = _clamp(novo, self.cfg.bias_min, self.cfg.bias_max)
                 else:
-                    # leve penalização para quem não ajudou
-                    self.state.bias_num[d] = _clamp(
-                        self.state.bias_num.get(d, 0.0) + self.cfg.bias_miss_delta * 0.2,
-                        -5.0,
-                        5.0,
-                    )
-        else:
-            # lote fraco: corrige levemente todos na direção do zero
+                    # penalização leve para quem não ajudou
+                    v = self.state.bias_num.get(d, 0.0)
+                    v = v + self.cfg.bias_miss_delta * 0.3
+                    self.state.bias_num[d] = _clamp(v, self.cfg.bias_min, self.cfg.bias_max)
+
+        elif lote_ruim:
+            # lote ruim → puxa tudo na direção do zero de forma mais firme
             for d in range(1, N_UNIVERSO + 1):
                 v = self.state.bias_num.get(d, 0.0)
-                if abs(v) < 0.05:
-                    self.state.bias_num[d] = 0.0
-                elif v > 0:
-                    self.state.bias_num[d] = v + self.cfg.bias_miss_delta * 0.5
-                else:
-                    self.state.bias_num[d] = v - self.cfg.bias_miss_delta * 0.5
-                self.state.bias_num[d] = _clamp(self.state.bias_num[d], -5.0, 5.0)
+                v *= 0.85  # contrai
+                if abs(v) < 0.03:
+                    v = 0.0
+                self.state.bias_num[d] = _clamp(v, self.cfg.bias_min, self.cfg.bias_max)
+        else:
+            # lote neutro → pequeno "relaxamento" em direção ao zero
+            for d in range(1, N_UNIVERSO + 1):
+                v = self.state.bias_num.get(d, 0.0)
+                v *= 0.95
+                if abs(v) < 0.02:
+                    v = 0.0
+                self.state.bias_num[d] = _clamp(v, self.cfg.bias_min, self.cfg.bias_max)
 
-        # Atualiza alpha
+        # ------------------------ Atualiza alpha (suave) ------------------------
+
         if lote_bom:
             self.state.alpha = _clamp(
                 self.state.alpha + self.cfg.alpha_up,
                 self.cfg.alpha_min,
                 self.cfg.alpha_max,
             )
-        else:
+        elif lote_ruim:
             self.state.alpha = _clamp(
                 self.state.alpha + self.cfg.alpha_down,
                 self.cfg.alpha_min,
                 self.cfg.alpha_max,
             )
+        else:
+            # puxa levemente alpha de volta para o alpha_init (estabilidade)
+            alvo = self.cfg.alpha_init
+            self.state.alpha = _clamp(
+                self.state.alpha + (alvo - self.state.alpha) * 0.05,
+                self.cfg.alpha_min,
+                self.cfg.alpha_max,
+            )
 
-        # registra no histórico
+        # ------------------------ Registra no histórico ------------------------
+
         rec = {
             "ts": datetime.utcnow().isoformat() + "Z",
             "tag": tag,
