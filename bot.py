@@ -1,7 +1,7 @@
 from __future__ import annotations
 import logging
 import os
-from typing import List
+from typing import List, Dict, Set
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -10,6 +10,8 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 from engine_oraculo import OraculoEngine, EngineConfig, shape_ok_mestre, paridade, max_seq
@@ -27,10 +29,12 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "COLOQUE_SEU_TOKEN_AQUI")
 TIMEZONE = os.environ.get("TZ", "America/Sao_Paulo")
 HISTORY_PATH = os.environ.get("HISTORY_PATH", "data/history.csv")
 
-# Lista de usuários autorizados (string separada por vírgula)
+# Lista de usuários administradores (string separada por vírgula)
 # Exemplo: ADMIN_IDS="123456789,987654321"
 ADMIN_IDS_ENV = os.environ.get("ADMIN_IDS", "")
-ADMIN_IDS = {int(x) for x in ADMIN_IDS_ENV.replace(" ", "").split(",") if x.isdigit()}
+ADMIN_IDS: Set[int] = {
+    int(x) for x in ADMIN_IDS_ENV.replace(" ", "").split(",") if x.isdigit()
+}
 
 # ------------------------ Estado em memória (/gerar -> /confirmar) ------------------------
 
@@ -38,6 +42,102 @@ ADMIN_IDS = {int(x) for x in ADMIN_IDS_ENV.replace(" ", "").split(",") if x.isdi
 LAST_APOSTAS: List[List[int]] = []
 # Base (último resultado do history) usada para gerar esse lote
 LAST_BASE: List[int] = []
+
+# ------------------------ Segurança / Avisos / Bloqueios ------------------------
+
+# Avisos por usuário (3 avisos → bloqueio)
+WARNINGS: Dict[int, int] = {}
+# Usuários bloqueados (após 3 avisos)
+BLOCKED_USERS: Set[int] = set()
+
+# Anti-flood simples (por user + comando)
+_last_call_per_user: Dict[tuple[int, str], float] = {}
+COOLDOWN_SECONDS = 8.0
+
+
+def _hit_cooldown(user_id: int, comando: str, cooldown: float = COOLDOWN_SECONDS) -> bool:
+    import time
+
+    key = (user_id, comando)
+    now = time.time()
+    last = _last_call_per_user.get(key, 0.0)
+    if now - last < cooldown:
+        return True
+    _last_call_per_user[key] = now
+    return False
+
+
+def _is_admin(user_id: int) -> bool:
+    """
+    Retorna True se o usuário é administrador.
+    - Se ADMIN_IDS estiver vazio, considera todos como admin (modo desenvolvimento).
+    - Em produção, configure ADMIN_IDS com seu ID para restringir.
+    """
+    if not ADMIN_IDS:
+        return True
+    return user_id in ADMIN_IDS
+
+
+def _is_blocked(user_id: int) -> bool:
+    return user_id in BLOCKED_USERS
+
+
+def _usuario_autorizado(user_id: int) -> bool:
+    """
+    Autorização geral para uso do bot:
+    - Usuário NÃO pode estar bloqueado.
+    - Não exige ser admin (para /gerar).
+    """
+    if _is_blocked(user_id):
+        return False
+    return True
+
+
+async def _registrar_infracao(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Registra 1 infração quando o usuário envia algo que não deve:
+    - Texto aleatório (sem comando)
+    - Foto, documento, áudio, sticker, etc.
+    Regras:
+    - Admin NUNCA recebe infração.
+    - Usuário comum recebe até 3 avisos; no 3º é bloqueado.
+    """
+    user = update.effective_user
+    msg = update.message
+
+    if user is None or msg is None:
+        return
+
+    user_id = user.id
+
+    # Admin nunca leva strike
+    if _is_admin(user_id):
+        return
+
+    # Se já estiver bloqueado, só avisa
+    if _is_blocked(user_id):
+        await msg.reply_text("🚫 Você está bloqueado. Entre em contato com o administrador.")
+        return
+
+    # Incrementa aviso
+    WARNINGS[user_id] = WARNINGS.get(user_id, 0) + 1
+    avisos = WARNINGS[user_id]
+
+    if avisos < 3:
+        await msg.reply_text(
+            f"⚠️ Aviso {avisos}/3:\n"
+            "Este bot aceita apenas comandos válidos (ex.: /gerar).\n"
+            "Mensagens de texto, fotos, áudios ou outros envios fora do padrão não são permitidos.\n"
+            "Após 3 avisos, seu acesso será bloqueado."
+        )
+    else:
+        # Bloqueia usuário
+        BLOCKED_USERS.add(user_id)
+        await msg.reply_text(
+            "🚫 Seu acesso ao bot foi BLOQUEADO por uso indevido (3 avisos).\n"
+            "Apenas o administrador pode reverter esse bloqueio."
+        )
+        logger.warning(f"Usuário {user_id} bloqueado por uso indevido.")
 
 
 # ------------------------ Helpers de histórico ------------------------
@@ -108,51 +208,39 @@ def ultimo_resultado(historico: List[List[int]]) -> List[int]:
     return list(sorted(historico[0]))
 
 
-# ------------------------ Helpers de autorização ------------------------
-
-
-def _usuario_autorizado(user_id: int) -> bool:
-    """Somente IDs na lista de admin são autorizados. Ajuste se quiser outra regra."""
-    if not ADMIN_IDS:
-        # se não tiver admin configurado, libera para todos (cuidado!)
-        return True
-    return user_id in ADMIN_IDS
-
-
-# Anti-flood simples (por user + comando)
-_last_call_per_user: dict[tuple[int, str], float] = {}
-COOLDOWN_SECONDS = 8.0
-
-
-def _hit_cooldown(user_id: int, comando: str, cooldown: float = COOLDOWN_SECONDS) -> bool:
-    import time
-
-    key = (user_id, comando)
-    now = time.time()
-    last = _last_call_per_user.get(key, 0.0)
-    if now - last < cooldown:
-        return True
-    _last_call_per_user[key] = now
-    return False
-
-
 # ---------------------------- Comandos ----------------------------
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id if update.effective_user else 0
-    msg = (
-        "👋 Bem-vindo ao *LotoFácil Oráculo Supremo*.\n\n"
-        "Comandos principais:\n"
-        "/gerar – gera suas apostas Mestre com base no último resultado do histórico.\n"
-        "/confirmar <15 dezenas> – aplica aprendizado sobre o último lote gerado.\n\n"
-        "Use /meuid para ver seu ID e configurar autorização."
-    )
+    user = update.effective_user
+    uid = user.id if user else 0
+
+    # Mensagem diferente para admin x usuário comum
+    if _is_admin(uid):
+        msg = (
+            "👋 Bem-vindo ao *LotoFácil Oráculo Supremo*.\n\n"
+            "Comandos principais:\n"
+            "/gerar – gera suas apostas Mestre com base no último resultado do histórico.\n"
+            "/confirmar <15 dezenas> – aplica aprendizado sobre o último lote gerado (ADMIN).\n"
+            "/desbloquear <id> – remove bloqueio de um usuário (ADMIN).\n"
+            "/meuid – mostra seu ID.\n\n"
+            "Use com responsabilidade."
+        )
+    else:
+        msg = (
+            "👋 Bem-vindo ao *LotoFácil Oráculo Supremo*.\n\n"
+            "Comandos disponíveis para você:\n"
+            "/gerar – gera suas apostas Mestre com base no último resultado do histórico.\n"
+            "/meuid – mostra seu ID.\n\n"
+            "⚠️ Não envie mensagens de texto aleatórias, fotos, áudios ou outros tipos de mídia.\n"
+            "O bot é focado apenas em comandos. Após 3 avisos, seu acesso será bloqueado."
+        )
+
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def meuid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id if update.effective_user else 0
+    user = update.effective_user
+    uid = user.id if user else 0
     await update.message.reply_text(f"Seu ID é: `{uid}`", parse_mode="Markdown")
 
 
@@ -168,6 +256,14 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = user.id if user else 0
     chat_id = update.effective_chat.id
 
+    # Bloqueio global
+    if _is_blocked(user_id):
+        return await update.message.reply_text(
+            "🚫 Seu acesso ao bot está bloqueado.\n"
+            "Apenas o administrador pode reverter esse bloqueio."
+        )
+
+    # Para /gerar, não exigimos admin — apenas não pode estar bloqueado
     if not _usuario_autorizado(user_id):
         return await update.message.reply_text("⛔ Você não está autorizado a usar este bot.")
 
@@ -325,16 +421,16 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # --------------------------------------------------------
-# /confirmar — aplica aprendizado sobre o ÚLTIMO lote gerado
-#              e mostra desempenho aposta a aposta
+# /confirmar — apenas ADMIN, aplica aprendizado sobre o ÚLTIMO lote
 # --------------------------------------------------------
 
 async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     user_id = user.id if user else 0
 
-    if not _usuario_autorizado(user_id):
-        return await update.message.reply_text("⛔ Você não está autorizado a usar este bot.")
+    # Somente ADMIN
+    if not _is_admin(user_id):
+        return await update.message.reply_text("⛔ Este comando é restrito ao administrador.")
 
     # Anti flood
     if _hit_cooldown(user_id, "confirmar", cooldown=4.0):
@@ -383,7 +479,7 @@ async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lote_bom = relatorio.get("lote_bom", False)
 
     # Monta relatório aposta a aposta
-    linhas: list[str] = []
+    linhas: List[str] = []
 
     linhas.append("✅ <b>Resultado analisado com sucesso!</b>\n")
     linhas.append(
@@ -439,6 +535,44 @@ async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(msg, parse_mode="HTML")
 
 
+# --------------------------------------------------------
+# /desbloquear — ADMIN remove bloqueio de um usuário
+# --------------------------------------------------------
+
+async def desbloquear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    user_id = user.id if user else 0
+
+    if not _is_admin(user_id):
+        return await update.message.reply_text("⛔ Este comando é restrito ao administrador.")
+
+    texto = (update.message.text or "").strip().split()
+    if len(texto) < 2 or not texto[1].isdigit():
+        return await update.message.reply_text(
+            "Use: /desbloquear <ID_DO_USUARIO>\n"
+            "Exemplo: /desbloquear 123456789"
+        )
+
+    alvo_id = int(texto[1])
+
+    # Remove bloqueio e avisos
+    BLOCKED_USERS.discard(alvo_id)
+    WARNINGS.pop(alvo_id, None)
+
+    await update.message.reply_text(
+        f"✅ Usuário {alvo_id} foi DESBLOQUEADO e contadores de aviso foram zerados."
+    )
+
+
+# --------------------------------------------------------
+# Handler genérico para qualquer conteúdo não-comando
+# (texto solto, foto, vídeo, documento, áudio, sticker, etc.)
+# --------------------------------------------------------
+
+async def anti_abuso_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _registrar_infracao(update, context)
+
+
 # ---------------------------- bootstrap ----------------------------
 
 def main() -> None:
@@ -447,10 +581,15 @@ def main() -> None:
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # Comandos
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("meuid", meuid))
     app.add_handler(CommandHandler("gerar", gerar))
     app.add_handler(CommandHandler("confirmar", confirmar))
+    app.add_handler(CommandHandler("desbloquear", desbloquear))
+
+    # Qualquer mensagem que NÃO seja comando cai aqui (segurança máxima)
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, anti_abuso_handler))
 
     logger.info("Bot iniciado. Aguardando comandos...")
     app.run_polling(close_loop=False)
