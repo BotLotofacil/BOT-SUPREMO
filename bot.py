@@ -297,6 +297,7 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # --------------------------------------------------------
 # /confirmar — aplica aprendizado sobre o ÚLTIMO lote gerado
+#              e mostra desempenho aposta a aposta
 # --------------------------------------------------------
 
 async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -306,14 +307,14 @@ async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _usuario_autorizado(user_id):
         return await update.message.reply_text("⛔ Você não está autorizado a usar este bot.")
 
+    # Anti flood
     if _hit_cooldown(user_id, "confirmar", cooldown=4.0):
-        return await update.message.reply_text(
-            "⏳ Aguarde alguns segundos antes de usar /confirmar novamente."
-        )
+        return await update.message.reply_text("⏳ Aguarde alguns segundos antes de usar /confirmar novamente.")
 
-    partes = update.message.text.strip().split()
-    dezenas_raw = partes[1:]
+    texto = (update.message.text or "").strip().split()
+    dezenas_raw = texto[1:]  # tudo após /confirmar
 
+    # Validação das dezenas
     try:
         dezenas = [int(x) for x in dezenas_raw]
     except Exception:
@@ -324,57 +325,89 @@ async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     dezenas = sorted(dezenas)
 
-    # Verifica se existe lote em memória
-    global LAST_APOSTAS, LAST_BASE
+    # Garante que existe um lote anterior
     if not LAST_APOSTAS:
         return await update.message.reply_text(
-            "⚠️ Ainda não há um lote em memória.\n"
-            "Use /gerar para produzir apostas e depois chame /confirmar com o resultado oficial."
+            "⚠️ Ainda não há lote em memória.\n"
+            "Use primeiro o comando /gerar para o bot ter apostas para analisar."
         )
 
+    # Núcleo de aprendizado
     learn = LearningCore()
-    alpha_antes = learn.get_alpha()
+    alpha_before = learn.get_alpha()
 
     try:
-        resumo = learn.aprender_com_lote(oficial=dezenas, apostas=LAST_APOSTAS, tag="confirmar")
+        relatorio = learn.aprender_com_lote(
+            oficial=dezenas,
+            apostas=LAST_APOSTAS,
+            tag="confirmar",
+        )
     except Exception as e:
-        logger.error("Erro no aprendizado em /confirmar", exc_info=True)
+        logger.error(f"Erro no aprendizado em /confirmar: {e}", exc_info=True)
         return await update.message.reply_text(f"Erro interno no aprendizado: {e}")
 
-    alpha_depois = resumo.get("alpha", alpha_antes)
-    media = resumo.get("media", 0.0)
-    topk = resumo.get("topk", 0.0)
-    melhor = resumo.get("melhor", 0)
-    lote_bom = resumo.get("lote_bom", False)
+    media = relatorio.get("media", 0.0)
+    topk = relatorio.get("topk", 0.0)
+    melhor = relatorio.get("melhor", 0)
+    alpha_after = relatorio.get("alpha", alpha_before)
+    placares = relatorio.get("placares", [])
+    lote_bom = relatorio.get("lote_bom", False)
 
-    status = "✅ Lote considerado BOM para aprendizado." if lote_bom else "ℹ️ Lote fraco: ajuste suave aplicado."
+    # Monta relatório aposta a aposta
+    linhas: list[str] = []
 
-    msg = [
-        "✅ <b>Resultado analisado com sucesso!</b>\n",
-        f"• Resultado informado: <b>{' '.join(f'{d:02d}' for d in dezenas)}</b>\n",
-        "<b>📊 Aprendizado aplicado sobre o ÚLTIMO lote gerado:</b>",
-        f"• Melhor aposta: <b>{melhor}</b> acertos",
-        f"• Média do lote: <b>{media:.2f}</b> acertos",
-        f"• Top-K médio: <b>{topk:.2f}</b> acertos",
-        "",
-        f"• Alpha antes: <b>{alpha_antes:.3f}</b>",
-        f"• Alpha depois: <b>{alpha_depois:.3f}</b>",
-        "",
-        status,
-    ]
-
-    if LAST_BASE:
-        msg.append(
-            "\n<b>Base usada no último /gerar:</b> "
-            + " ".join(f"{d:02d}" for d in LAST_BASE)
-        )
-
-    msg.append(
-        "\n<i>O histórico de resultados (history.csv) não foi alterado; "
-        "atualize-o manualmente como de costume.</i>"
+    linhas.append("✅ <b>Resultado analisado com sucesso!</b>\n")
+    linhas.append(
+        "• Resultado informado: <b>"
+        + " ".join(f"{d:02d}" for d in dezenas)
+        + "</b>\n"
     )
 
-    await update.message.reply_text("\n".join(msg), parse_mode="HTML")
+    linhas.append("<b>📊 Aprendizado aplicado sobre o ÚLTIMO lote gerado:</b>")
+    linhas.append(f"• Melhor aposta: <b>{melhor}</b> acertos")
+    linhas.append(f"• Média do lote: <b>{media:.2f}</b> acertos")
+    linhas.append(f"• Top-K médio: <b>{topk:.2f}</b> acertos")
+    linhas.append("")
+    linhas.append(f"• Alpha antes: <b>{alpha_before:.3f}</b>")
+    linhas.append(f"• Alpha depois: <b>{alpha_after:.3f}</b>")
+
+    if lote_bom:
+        linhas.append("• Qualificação do lote: <b>Lote forte</b> — reforço mais intenso aplicado nas dezenas-chave.")
+    else:
+        linhas.append("• Qualificação do lote: <b>Lote fraco</b> — ajuste suave, puxando bias em direção ao neutro.")
+
+    linhas.append("\n🔍 <b>Desempenho aposta a aposta (vs. resultado informado):</b>")
+
+    for i, aposta in enumerate(LAST_APOSTAS, start=1):
+        hit = placares[i - 1] if i - 1 < len(placares) else _hits(aposta, dezenas)
+        pares, imp = paridade(aposta)
+        seq = max_seq(aposta)
+        R = len(set(aposta) & set(dezenas))
+        status = "✅ OK" if (7 <= pares <= 8 and seq <= 3) else "🛠️ REVER"
+
+        linhas.append(
+            f"<b>Aposta {i}:</b> "
+            + " ".join(f"{n:02d}" for n in sorted(aposta))
+        )
+        linhas.append(
+            f"   🔢 Pares: {pares} | Ímpares: {imp} | SeqMax: {seq} | {R}R | "
+            f"<i>{hit} acertos</i> | {status}"
+        )
+
+    # Base usada no último /gerar
+    if LAST_BASE:
+        base_txt = " ".join(f"{d:02d}" for d in LAST_BASE)
+        linhas.append(
+            f"\n<i>Base usada no último /gerar (resultado de referência do lote): {base_txt}</i>"
+        )
+    else:
+        linhas.append(
+            "\n<i>Base usada no último /gerar: não disponível (LAST_BASE vazio).</i>"
+        )
+
+    msg = "\n".join(linhas)
+
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 # ---------------------------- bootstrap ----------------------------
