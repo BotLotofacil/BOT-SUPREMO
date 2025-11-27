@@ -29,6 +29,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "COLOQUE_SEU_TOKEN_AQUI")
 TIMEZONE = os.environ.get("TZ", "America/Sao_Paulo")
 HISTORY_PATH = os.environ.get("HISTORY_PATH", "data/history.csv")
 
+# Caminho do arquivo de estado de aprendizado (deve apontar para um volume no Railway)
+LEARN_STATE_PATH = os.environ.get("LEARN_STATE_PATH", "data/learn_state.json")
+
 # Admin fixo (não depende de variável de ambiente)
 # Somente este ID terá acesso aos comandos administrativos
 ADMIN_IDS: Set[int] = {5344714174}
@@ -256,6 +259,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/confirmar &lt;15 dezenas&gt; – aplica aprendizado sobre o último lote gerado (ADMIN).\n"
             "/desbloquear &lt;id&gt; – remove bloqueio de um usuário (ADMIN).\n"
             "/lista_bloqueados – lista todos os usuários bloqueados (ADMIN).\n"
+            "/debug_state – mostra alpha, viés numérico e tamanho da memória (ADMIN).\n"
             "/meuid – mostra seu ID.\n\n"
             "Use com responsabilidade."
         )
@@ -627,6 +631,63 @@ async def lista_bloqueados(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # --------------------------------------------------------
+# /debug_state — ADMIN: inspeciona estado de aprendizado
+# --------------------------------------------------------
+
+async def debug_state(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    user_id = user.id if user else 0
+
+    if not _is_admin(user_id):
+        return await update.message.reply_text("⛔ Este comando é restrito ao administrador.")
+
+    learn = LearningCore()
+    alpha = learn.get_alpha()
+    bias_num = learn.get_bias_num() or {}
+
+    # Tamanho da memória (quantos lotes armazenados)
+    try:
+        memoria = getattr(learn, "state", None)
+        history = getattr(memoria, "history", []) if memoria is not None else []
+        mem_len = len(history)
+    except Exception:
+        mem_len = 0
+
+    janela = getattr(getattr(learn, "cfg", None), "janela", None)
+    state_path = getattr(learn, "path", LEARN_STATE_PATH)
+
+    linhas: List[str] = []
+
+    linhas.append("🧠 <b>DEBUG DO NÚCLEO DE APRENDIZADO</b>\n")
+    linhas.append(f"• Arquivo de estado: <code>{state_path}</code>")
+    linhas.append(f"• Alpha atual: <b>{alpha:.3f}</b>")
+
+    if janela is not None:
+        linhas.append(f"• Janela configurada: <b>{janela}</b> concursos")
+
+    linhas.append(f"• Lotes armazenados em memória: <b>{mem_len}</b>")
+
+    if bias_num:
+        itens = sorted(bias_num.items(), key=lambda kv: kv[1], reverse=True)
+        top_pos = itens[:5]
+        top_neg = sorted(itens, key=lambda kv: kv[1])[:5]
+
+        def fmt(lst: List[tuple[int, float]]) -> str:
+            return ", ".join(f"{dez:02d}({valor:+.3f})" for dez, valor in lst)
+
+        linhas.append("\n<b>Top vieses POSITIVOS (dezenas mais reforçadas):</b>")
+        linhas.append(fmt(top_pos))
+
+        linhas.append("\n<b>Top vieses NEGATIVOS (dezenas mais enfraquecidas):</b>")
+        linhas.append(fmt(top_neg))
+    else:
+        linhas.append("\nNenhum viés numérico armazenado ainda (bias_num vazio).")
+
+    msg = "\n".join(linhas)
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
+# --------------------------------------------------------
 # Handler genérico para qualquer conteúdo não-comando
 # (texto solto, foto, vídeo, documento, áudio, sticker, etc.)
 # --------------------------------------------------------
@@ -640,6 +701,9 @@ async def anti_abuso_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 def main() -> None:
     if not BOT_TOKEN or BOT_TOKEN == "COLOQUE_SEU_TOKEN_AQUI":
         raise RuntimeError("Defina BOT_TOKEN no ambiente ou dentro do bot.py antes de rodar.")
+
+    # Log de caminho de estado de aprendizado (para conferência)
+    logger.info(f"LEARN_STATE_PATH em uso: {LEARN_STATE_PATH}")
 
     # Recarrega whitelist no início (caso o arquivo tenha mudado entre deploys)
     global WHITELIST_IDS
@@ -655,6 +719,7 @@ def main() -> None:
     app.add_handler(CommandHandler("confirmar", confirmar))
     app.add_handler(CommandHandler("desbloquear", desbloquear))
     app.add_handler(CommandHandler("lista_bloqueados", lista_bloqueados))
+    app.add_handler(CommandHandler("debug_state", debug_state))
 
     # Qualquer mensagem que NÃO seja comando cai aqui (segurança máxima)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, anti_abuso_handler))
