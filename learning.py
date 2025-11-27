@@ -33,7 +33,7 @@ class LearnConfig:
     alpha_init: float = 0.36
 
     # Memória REAL (quantos concursos recentes entram no cálculo)
-    janela: int = 50
+    janela: int = 80
 
     # referencial inicial (usado só no comecinho, até ter histórico)
     media_ref: float = 9.8
@@ -72,7 +72,7 @@ class LearningCore:
     """
     Núcleo de aprendizado REAL:
     - Mantém alpha, janela e bias_num
-    - Usa memória de até 50 concursos (history)
+    - Usa memória de até 80 concursos (history)
     - Gating baseado em desempenho relativo (média/top-k vs histórico)
     """
 
@@ -174,7 +174,7 @@ class LearningCore:
         - bias_num (dezena a dezena)
         - alpha (força de repetição)
 
-        Usa memória de até 50 concursos para decidir se o lote é:
+        Usa memória de até 80 concursos para decidir se o lote é:
         - "forte" (acima do histórico) → reforça
         - "fraco" (abaixo do histórico) → corrige
         - "neutro" → ajustes mínimos
