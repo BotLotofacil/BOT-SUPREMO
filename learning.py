@@ -8,6 +8,12 @@ Agora com:
 - Janela deslizante de concursos (cfg.janela).
 - Funções para registrar lotes gerados e aprender com o resultado oficial.
 - Sincronização OPCIONAL com GitHub (se variáveis de ambiente forem configuradas).
+
+Versão ajustada para aprendizado um pouco mais AGRESSIVO:
+- Alpha reage mais ao desempenho do lote.
+- Critério de alvo de desempenho ligeiramente relaxado.
+- Bias por dezena mais seletivo (reforça forte quem foi muito bem,
+  enfraquece forte quem foi muito mal, quase neutro para apostas medianas).
 """
 
 import json
@@ -77,7 +83,7 @@ class LearningCore:
 
     Responsabilidades:
     - Carregar e salvar LearnState em JSON.
-    - Manter janela deslizante de resultados oficiais.
+    - M ant er janela deslizante de resultados oficiais.
     - Atualizar bias_num com base em desempenho de lotes /confirmar.
     """
 
@@ -236,7 +242,7 @@ class LearningCore:
                 if resp_put.status_code >= 400:
                     print(
                         f"[LearningCore] Falha ao fazer PUT no GitHub "
-                        f"(status={resp_put.status_code}): {resp_put.text[:200]}"
+                        f"(status={resp_put.status_code}): {resp_put.text[:200]}",
                     )
         except Exception as e:
             print(f"[LearningCore] Exceção ao sincronizar com GitHub: {e}")
@@ -326,39 +332,64 @@ class LearningCore:
         melhor = max(placares)
         media = sum(placares) / len(placares)
 
+        # K adaptativo (top 1 a top 3)
         k = max(1, min(3, len(apostas) // 3))
         topk_vals = sorted(placares, reverse=True)[:k]
         topk = sum(topk_vals) / len(topk_vals)
 
-        alvo_topk = 10.0
+        # ------------------------------------------------------------------
+        # Ajuste de alpha (um pouco mais agressivo que a versão anterior)
+        # ------------------------------------------------------------------
+        # Alvo ligeiramente abaixo de 10 para reconhecer mais lotes bons.
+        alvo_topk = 9.8
         delta = topk - alvo_topk
 
         alpha_old = float(self.state.alpha)
-        alpha_new = alpha_old + 0.02 * delta
+
+        # Antes: 0.02 * delta → agora 0.04 * delta (responde mais rápido).
+        alpha_step = 0.04
+        alpha_new = alpha_old + alpha_step * delta
+
+        # Mantém alpha em faixa segura
         alpha_new = max(0.10, min(0.80, alpha_new))
         self.state.alpha = alpha_new
 
         dezenas_oficial = set(oficial)
 
+        # ------------------------------------------------------------------
+        # Atualização do bias por dezena (mais seletivo/agressivo)
+        # ------------------------------------------------------------------
         bias = dict(self.state.bias_num)
 
-        for aposta, score in zip(apostas, placares):
+        for aposta, acertos in zip(apostas, placares):
             dez = set(aposta)
-            acertos = len(dez & dezenas_oficial)
 
-            if acertos >= 11:
-                fator = +1.0
-            elif acertos >= 9:
-                fator = +0.6
-            elif acertos <= 5:
+            # Regras:
+            # - 12+ acertos: reforço máximo
+            # - 11 acertos: reforço forte
+            # - 10 acertos: reforço moderado
+            # - 8–9 acertos: praticamente neutro
+            # - 6–7 acertos: enfraquecimento moderado
+            # - 0–5 acertos: enfraquecimento forte
+            if acertos >= 12:
+                fator = +1.2
+            elif acertos == 11:
+                fator = +0.9
+            elif acertos == 10:
+                fator = +0.4
+            elif 8 <= acertos <= 9:
+                fator = 0.0
+            elif 6 <= acertos <= 7:
                 fator = -0.4
-            else:
-                fator = -0.1
+            else:  # acertos <= 5
+                fator = -0.9
 
+            # Aplica esse fator ponderado pelo alpha atual
             for d in dez:
                 if 1 <= d <= 25:
                     bias[d] = bias.get(d, 0.0) + fator * alpha_new
 
+        # Normalização para manter os valores em [-1, 1]
         max_abs = max((abs(v) for v in bias.values()), default=0.0)
         if max_abs > 0:
             coef = 1.0 / max_abs
@@ -367,6 +398,9 @@ class LearningCore:
 
         self.state.bias_num = bias
 
+        # ------------------------------------------------------------------
+        # Registro de telemetria do aprendizado
+        # ------------------------------------------------------------------
         meta = self.state.meta.get("aprendizado", [])
         meta.append(
             {
