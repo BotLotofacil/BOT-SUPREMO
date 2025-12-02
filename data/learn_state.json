@@ -505,6 +505,158 @@
       25
     ]
   ],
+  "stats_num": {
+    "1": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "2": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "3": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "4": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "5": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "6": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "7": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "8": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "9": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "10": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "11": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "12": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "13": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "14": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "15": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "16": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "17": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "18": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "19": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "20": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "21": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "22": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "23": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "24": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    },
+    "25": {
+      "hits": 0,
+      "miss": 0,
+      "good": 0,
+      "bad": 0
+    }
+  },
   "meta": {
     "lotes": [
       {
