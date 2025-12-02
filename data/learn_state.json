@@ -945,156 +945,173 @@
       21,
       22,
       25
+    ],
+    [
+      1,
+      4,
+      6,
+      7,
+      8,
+      12,
+      13,
+      15,
+      16,
+      18,
+      19,
+      20,
+      22,
+      23,
+      24
     ]
   ],
   "stats_num": {
     "1": {
-      "hits": 26,
+      "hits": 27,
       "miss": 0,
       "good": 15,
       "bad": 14
     },
     "2": {
       "hits": 13,
-      "miss": 13,
+      "miss": 14,
       "good": 15,
       "bad": 8
     },
     "3": {
       "hits": 13,
-      "miss": 13,
+      "miss": 14,
       "good": 11,
       "bad": 7
     },
     "4": {
-      "hits": 13,
+      "hits": 14,
       "miss": 13,
       "good": 9,
       "bad": 10
     },
     "5": {
       "hits": 0,
-      "miss": 26,
+      "miss": 27,
       "good": 8,
       "bad": 12
     },
     "6": {
-      "hits": 13,
+      "hits": 14,
       "miss": 13,
       "good": 7,
       "bad": 13
     },
     "7": {
-      "hits": 26,
+      "hits": 27,
       "miss": 0,
       "good": 14,
       "bad": 4
     },
     "8": {
-      "hits": 26,
+      "hits": 27,
       "miss": 0,
       "good": 16,
       "bad": 9
     },
     "9": {
       "hits": 0,
-      "miss": 26,
+      "miss": 27,
       "good": 4,
       "bad": 11
     },
     "10": {
       "hits": 13,
-      "miss": 13,
+      "miss": 14,
       "good": 14,
       "bad": 7
     },
     "11": {
       "hits": 13,
-      "miss": 13,
+      "miss": 14,
       "good": 14,
       "bad": 7
     },
     "12": {
-      "hits": 26,
+      "hits": 27,
       "miss": 0,
       "good": 17,
       "bad": 6
     },
     "13": {
-      "hits": 13,
+      "hits": 14,
       "miss": 13,
       "good": 3,
       "bad": 13
     },
     "14": {
       "hits": 0,
-      "miss": 26,
+      "miss": 27,
       "good": 11,
       "bad": 10
     },
     "15": {
-      "hits": 26,
+      "hits": 27,
       "miss": 0,
       "good": 13,
       "bad": 5
     },
     "16": {
-      "hits": 26,
+      "hits": 27,
       "miss": 0,
       "good": 17,
       "bad": 7
     },
     "17": {
       "hits": 13,
-      "miss": 13,
+      "miss": 14,
       "good": 9,
       "bad": 6
     },
     "18": {
-      "hits": 13,
+      "hits": 14,
       "miss": 13,
       "good": 10,
       "bad": 14
     },
     "19": {
-      "hits": 26,
+      "hits": 27,
       "miss": 0,
       "good": 14,
       "bad": 9
     },
     "20": {
-      "hits": 13,
+      "hits": 14,
       "miss": 13,
       "good": 4,
       "bad": 12
     },
     "21": {
       "hits": 13,
-      "miss": 13,
+      "miss": 14,
       "good": 16,
       "bad": 2
     },
     "22": {
-      "hits": 26,
+      "hits": 27,
       "miss": 0,
       "good": 11,
       "bad": 9
     },
     "23": {
-      "hits": 13,
+      "hits": 14,
       "miss": 13,
       "good": 6,
       "bad": 15
     },
     "24": {
-      "hits": 13,
+      "hits": 14,
       "miss": 13,
       "good": 10,
       "bad": 14
     },
     "25": {
       "hits": 13,
-      "miss": 13,
+      "miss": 14,
       "good": 17,
       "bad": 1
     }
