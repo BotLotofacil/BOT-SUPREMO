@@ -1,13 +1,23 @@
 """
 learning.py
 
-Núcleo de aprendizado leve para o Oráculo da Lotofácil.
+Núcleo de aprendizado para o Oráculo da Lotofácil.
 
-Agora com:
-- Estado salvo em arquivo JSON (LEARN_STATE_PATH).
+Principais características:
+
+- Estado salvo em arquivo JSON (LEARN_STATE_PATH ou learn_state.json).
 - Janela deslizante de concursos (cfg.janela).
-- Funções para registrar lotes gerados e aprender com o resultado oficial.
-- Sincronização OPCIONAL com GitHub (se variáveis de ambiente forem configuradas).
+- Aprendizado baseado em:
+    * desempenho do lote (melhor, média, top-K)
+    * reforço/punição por dezena conforme acertos do lote
+    * memória acumulada de hits/misses e apostas boas/ruins
+- Alpha dinâmico (ajusta o "peso" do aprendizado com base no desempenho).
+- Bias por dezena normalizado em [-1, 1] para ser usado pelo gerador.
+- Sincronização OPCIONAL com GitHub:
+    * GITHUB_STATE_TOKEN  → token pessoal (PAT) com escopo de repo.
+    * GITHUB_STATE_REPO   → "dono/repositorio" (ex.: "BotLotofacil/BOT-SUPREMO").
+    * GITHUB_STATE_PATH   → caminho do arquivo (ex.: "data/learn_state.json").
+    * GITHUB_STATE_BRANCH → branch alvo (ex.: "state" ou "main").
 """
 
 from __future__ import annotations
@@ -18,6 +28,7 @@ import os
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from typing import Any, Dict, List
+
 
 # ----------------------------------------------------------------------
 # Configuração geral do aprendizado
@@ -30,11 +41,17 @@ class LearnConfig:
     Configuração do núcleo de aprendizado.
     """
 
-    # Janela de concursos a considerar (ex.: 80 últimos resultados)
+    # Quantos concursos manter no histórico (janela deslizante)
     janela: int = 80
 
-    # Fator base de aprendizado (alpha inicial quando não existe estado)
+    # Alpha base (ponto de partida e piso da adaptação)
     alpha_base: float = 0.36
+
+    # Alvo de desempenho para o top-K (em acertos)
+    alvo_topk: float = 10.0
+
+    # Passo de ajuste de alpha em função do desvio do alvo_topk
+    passo_alpha: float = 0.03
 
     # Caminho padrão do arquivo de estado
     state_path: str = field(
@@ -53,18 +70,24 @@ class LearnState:
     - alpha: fator de aprendizagem atual.
     - bias_num: viés por dezena (1..25) em float.
     - history: lista de últimos resultados oficiais conhecidos.
+    - stats_num: estatísticas por dezena (hits, misses, boas/ruins).
     - meta: metadados para debug ou análise posterior.
     """
 
     alpha: float = 0.36
     bias_num: Dict[int, float] = field(default_factory=dict)
     history: List[List[int]] = field(default_factory=list)
+    stats_num: Dict[int, Dict[str, int]] = field(default_factory=dict)
     meta: Dict[str, Any] = field(default_factory=dict)
 
 
 def _hits(aposta: List[int], oficial: List[int]) -> int:
     """Conta quantos acertos uma aposta teve vs. um resultado oficial."""
     return len(set(aposta) & set(oficial))
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
 # ----------------------------------------------------------------------
@@ -74,19 +97,20 @@ def _hits(aposta: List[int], oficial: List[int]) -> int:
 
 class LearningCore:
     """
-    Núcleo de aprendizado leve, sem depender de frameworks externos de ML.
+    Núcleo de aprendizado leve, independente de frameworks externos de ML.
 
     Responsabilidades:
     - Carregar e salvar LearnState em JSON.
+    - Sincronizar estado com GitHub (opcional).
     - Manter janela deslizante de resultados oficiais.
-    - Atualizar bias_num com base em desempenho de lotes (/confirmar).
+    - Atualizar bias_num com base em desempenho de lotes /confirmar.
     """
 
     def __init__(self, cfg: LearnConfig | None = None) -> None:
         self.cfg = cfg or LearnConfig()
         self.path = self.cfg.state_path or STATE_PATH_DEFAULT
 
-        self.state: LearnState = LearnState()
+        self.state: LearnState = LearnState(alpha=self.cfg.alpha_base)
         self._carregar_ou_inicializar()
 
     # ------------------------------------------------------
@@ -95,34 +119,98 @@ class LearningCore:
 
     def _carregar_ou_inicializar(self) -> None:
         """
-        Tenta carregar o estado de disco; se não existir, inicializa padrão.
-
-        IMPORTANTE:
-        - Se o arquivo já existe, NUNCA reseta o alpha para alpha_base.
-        - Apenas corrige formatos e limita a janela do histórico.
+        Tenta carregar o estado de disco; se não existir, tenta recuperar do GitHub.
+        Se tudo falhar, inicializa estado padrão.
         """
-        if not os.path.exists(self.path):
-            # Estado novo
-            self.state = LearnState(alpha=self.cfg.alpha_base)
+        # 1) Tenta carregar de arquivo local
+        if os.path.exists(self.path):
+            if self._try_load_from_local():
+                return
+
+        # 2) Se não deu, tenta baixar do GitHub (se configurado)
+        if self._try_load_from_github():
+            # Garante que já salva localmente assim que puxar da nuvem
             self._salvar()
             return
 
+        # 3) Estado novo
+        self.state = LearnState(alpha=self.cfg.alpha_base)
+        self._salvar()
+
+    def _try_load_from_local(self) -> bool:
+        """Carrega estado do arquivo local. Retorna True se deu certo."""
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception as e:
             print(f"[LearningCore] Erro ao carregar estado de '{self.path}': {e}")
-            self.state = LearnState(alpha=self.cfg.alpha_base)
-            self._salvar()
-            return
+            return False
 
-        # Alpha: se existir no JSON, preserva; senão usa alpha_base
+        try:
+            self._apply_loaded_data(data)
+            return True
+        except Exception as e:
+            print(f"[LearningCore] Erro ao interpretar estado local: {e}")
+            return False
+
+    def _try_load_from_github(self) -> bool:
+        """
+        Tenta buscar o estado de aprendizado a partir do arquivo salvo no GitHub.
+
+        Só entra aqui se as variáveis de ambiente estiverem configuradas.
+        Retorna True se conseguiu carregar algum JSON válido.
+        """
+        token = os.environ.get("GITHUB_STATE_TOKEN", "").strip()
+        repo = os.environ.get("GITHUB_STATE_REPO", "").strip()
+        path = os.environ.get("GITHUB_STATE_PATH", "").strip()
+        branch = os.environ.get("GITHUB_STATE_BRANCH", "main").strip() or "main"
+
+        if not token or not repo or not path:
+            return False
+
+        api_url = f"https://api.github.com/repos/{repo}/contents/{path}"
+
+        try:
+            import httpx
+
+            headers = {
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.get(api_url, headers=headers, params={"ref": branch})
+                if resp.status_code != 200:
+                    print(
+                        f"[LearningCore] GET GitHub estado falhou "
+                        f"(status={resp.status_code})"
+                    )
+                    return False
+
+                body = resp.json()
+                content_b64 = body.get("content")
+                if not content_b64:
+                    return False
+
+                decoded = base64.b64decode(content_b64).decode("utf-8")
+                data = json.loads(decoded)
+
+                self._apply_loaded_data(data)
+                print("[LearningCore] Estado recuperado do GitHub com sucesso.")
+                return True
+        except Exception as e:
+            print(f"[LearningCore] Erro ao recuperar estado do GitHub: {e}")
+            return False
+
+    def _apply_loaded_data(self, data: Dict[str, Any]) -> None:
+        """Converte o dicionário carregado em LearnState."""
         try:
             alpha = float(data.get("alpha", self.cfg.alpha_base))
         except Exception:
             alpha = self.cfg.alpha_base
 
-        # Bias numérico
+        # bias_num pode vir com chaves str ou int
         bias_raw = data.get("bias_num", {})
         bias_num: Dict[int, float] = {}
         for k, v in bias_raw.items():
@@ -134,31 +222,48 @@ class LearningCore:
             except Exception:
                 continue
 
-        # Histórico
+        # histórico de resultados
         history_raw = data.get("history", [])
         history: List[List[int]] = []
         for linha in history_raw:
             try:
                 dezenas = [int(x) for x in linha]
                 dezenas = sorted({d for d in dezenas if 1 <= d <= 25})
-                # guarda apenas resultados com pelo menos 15 dezenas válidas
                 if len(dezenas) >= 15:
                     history.append(dezenas)
             except Exception:
                 continue
 
-        # Limita janela
-        if len(history) > self.cfg.janela:
-            history = history[-self.cfg.janela :]
+        # stats_num (opcional em estados antigos)
+        stats_raw = data.get("stats_num", {})
+        stats_num: Dict[int, Dict[str, int]] = {}
+        for k, v in stats_raw.items():
+            try:
+                ik = int(k)
+                if not (1 <= ik <= 25):
+                    continue
+                stats_num[ik] = {
+                    "hits": int(v.get("hits", 0)),
+                    "miss": int(v.get("miss", 0)),
+                    "good": int(v.get("good", 0)),
+                    "bad": int(v.get("bad", 0)),
+                }
+            except Exception:
+                continue
 
         meta = data.get("meta", {})
-        if not isinstance(meta, dict):
-            meta = {}
 
-        self.state = LearnState(alpha=alpha, bias_num=bias_num, history=history, meta=meta)
+        self.state = LearnState(
+            alpha=alpha,
+            bias_num=bias_num,
+            history=history,
+            stats_num=stats_num,
+            meta=meta,
+        )
 
-        # Salva de volta para normalizar estrutura, se necessário
-        self._salvar()
+        # Garante janela máxima
+        if len(self.state.history) > self.cfg.janela:
+            self.state.history = self.state.history[-self.cfg.janela :]
 
     def _salvar(self) -> None:
         """
@@ -170,18 +275,26 @@ class LearningCore:
         """
         raw = asdict(self.state)
 
-        # Converte chaves do bias_num para int explícito
+        # Serialização amigável
         raw["bias_num"] = {int(k): float(v) for k, v in self.state.bias_num.items()}
+        raw["history"] = list(self.state.history)[-self.cfg.janela :]
 
-        # Garante a janela máxima de histórico
-        raw_history = list(self.state.history)[-self.cfg.janela :]
-        raw["history"] = raw_history
+        # stats_num: garante ints
+        stats_num_serial: Dict[int, Dict[str, int]] = {}
+        for d in range(1, 26):
+            st = self.state.stats_num.get(d, {})
+            stats_num_serial[d] = {
+                "hits": int(st.get("hits", 0)),
+                "miss": int(st.get("miss", 0)),
+                "good": int(st.get("good", 0)),
+                "bad": int(st.get("bad", 0)),
+            }
+        raw["stats_num"] = stats_num_serial
 
         # 1) Salva localmente no container (melhor esforço)
         try:
-            dirpath = os.path.dirname(self.path)
-            if dirpath:
-                os.makedirs(dirpath, exist_ok=True)
+            dirname = os.path.dirname(self.path) or "."
+            os.makedirs(dirname, exist_ok=True)
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(raw, f, indent=2, ensure_ascii=False)
         except Exception as e:
@@ -200,8 +313,7 @@ class LearningCore:
     # ------------------------------------------------------
 
     def _sync_to_github(self, raw: dict) -> None:
-        """
-        Envia o estado para um arquivo em um repositório GitHub.
+        """Envia o estado para um arquivo em um repositório GitHub.
 
         Esta função é *opcional* e só roda se todas as variáveis abaixo
         estiverem definidas no ambiente do container (Railway):
@@ -209,7 +321,7 @@ class LearningCore:
         - GITHUB_STATE_TOKEN  → token pessoal (PAT) com escopo de repo.
         - GITHUB_STATE_REPO   → "dono/repositorio" (ex.: "BotLotofacil/BOT-SUPREMO").
         - GITHUB_STATE_PATH   → caminho do arquivo (ex.: "data/learn_state.json").
-        - GITHUB_STATE_BRANCH → branch alvo (ex.: "state") opcional, default="state".
+        - GITHUB_STATE_BRANCH → branch alvo (ex.: "state" ou "main").
 
         Se algo der errado (rede, auth, etc.), o erro é logado via print
         mas *não* interrompe o fluxo do bot.
@@ -217,7 +329,7 @@ class LearningCore:
         token = os.environ.get("GITHUB_STATE_TOKEN", "").strip()
         repo = os.environ.get("GITHUB_STATE_REPO", "").strip()
         path = os.environ.get("GITHUB_STATE_PATH", "").strip()
-        branch = os.environ.get("GITHUB_STATE_BRANCH", "state").strip() or "state"
+        branch = os.environ.get("GITHUB_STATE_BRANCH", "main").strip() or "main"
 
         if not token or not repo or not path:
             # Não configurado → nada a fazer.
@@ -236,8 +348,7 @@ class LearningCore:
         }
 
         try:
-            # httpx já vem como dependência indireta do python-telegram-bot
-            import httpx  # type: ignore
+            import httpx  # httpx já vem como dependência indireta do python-telegram-bot
 
             with httpx.Client(timeout=10.0) as client:
                 # Primeiro, tenta obter o SHA atual do arquivo (se existir)
@@ -269,33 +380,42 @@ class LearningCore:
     # ------------------------ API pública ------------------------
 
     def get_alpha(self) -> float:
-        """
-        Retorna o alpha atual carregado do estado persistente.
-        """
         return float(self.state.alpha)
 
     def get_bias_num(self) -> Dict[int, float]:
-        """
-        Retorna uma cópia do dicionário de viés numérico.
-        """
+        # Sempre retorna uma cópia para evitar mutação externa
         return dict(self.state.bias_num)
+
+    # ------------------------------------------------------
+    # Registro de resultados e lotes
+    # ------------------------------------------------------
 
     def registrar_resultado_oficial(self, dezenas: List[int]) -> None:
         """
         Registra um novo resultado oficial na memória de histórico,
-        respeitando a janela configurada.
+        respeitando a janela configurada. Também atualiza stats_num
+        com hits/misses por dezena.
         """
         dezenas = sorted({d for d in dezenas if 1 <= d <= 25})
         if len(dezenas) < 15:
             return
 
-        # Evita duplicar a última linha se for o mesmo resultado
-        if self.state.history and self.state.history[-1] == dezenas:
-            return
-
+        # Atualiza histórico
         self.state.history.append(dezenas)
         if len(self.state.history) > self.cfg.janela:
             self.state.history = self.state.history[-self.cfg.janela :]
+
+        # Atualiza contadores por dezena (hit/miss)
+        dezenas_set = set(dezenas)
+        for d in range(1, 26):
+            st = self.state.stats_num.setdefault(
+                d, {"hits": 0, "miss": 0, "good": 0, "bad": 0}
+            )
+            if d in dezenas_set:
+                st["hits"] += 1
+            else:
+                st["miss"] += 1
+
         self._salvar()
 
     def registrar_lote_gerado(
@@ -315,9 +435,6 @@ class LearningCore:
             self.registrar_resultado_oficial(dezenas)
 
         meta_lotes = self.state.meta.get("lotes", [])
-        if not isinstance(meta_lotes, list):
-            meta_lotes = []
-
         meta_lotes.append(
             {
                 "tag": tag,
@@ -357,63 +474,123 @@ class LearningCore:
         if not apostas:
             raise ValueError("Nenhuma aposta fornecida para aprendizado.")
 
-        # Garante que o histórico esteja atualizado
+        # Garante que o histórico esteja atualizado + stats hit/miss
         self.registrar_resultado_oficial(oficial)
 
+        # ---------------- Desempenho bruto do lote ----------------
         placares: List[int] = [_hits(a, oficial) for a in apostas]
         melhor = max(placares)
         media = sum(placares) / len(placares)
 
-        # Top-K adaptativo: até 3 apostas, ou 1/3 do lote
-        k = max(1, min(3, len(apostas) // 3))
+        k = max(1, min(3, len(apostas) // 3 or 1))
         topk_vals = sorted(placares, reverse=True)[:k]
         topk = sum(topk_vals) / len(topk_vals)
 
-        # Ajuste de alpha: alvo na faixa de ~10 acertos no topK
-        alvo_topk = 10.0
-        delta = topk - alvo_topk
-
+        # ---------------- Atualização de alpha ----------------
+        alvo = self.cfg.alvo_topk
+        delta = topk - alvo
         alpha_old = float(self.state.alpha)
-        alpha_new = alpha_old + 0.02 * delta
-        alpha_new = max(0.10, min(0.80, alpha_new))
+        alpha_new = alpha_old + self.cfg.passo_alpha * delta
+        alpha_new = _clamp(alpha_new, 0.10, 0.80)
         self.state.alpha = alpha_new
 
+        # ---------------- Reforço / punição por dezena ----------------
         dezenas_oficial = set(oficial)
 
-        # Atualiza bias_num com base no desempenho de cada aposta
-        bias = dict(self.state.bias_num)
+        # recompensa acumulada por dezena neste lote
+        reward: Dict[int, float] = {d: 0.0 for d in range(1, 26)}
 
+        # 1) Reforço direto: dezenas que caíram no resultado
+        for d in dezenas_oficial:
+            reward[d] += 2.0  # bônus forte para acertos oficiais
+
+        # 2) Apostas boas/ruins influenciam stats_num e reward
         for aposta, score in zip(apostas, placares):
-            dez = set(aposta)
-            acertos = len(dez & dezenas_oficial)
+            dez_set = set(aposta)
 
-            if acertos >= 11:
-                fator = +1.0
-            elif acertos >= 9:
-                fator = +0.6
-            elif acertos <= 5:
-                fator = -0.4
-            else:
-                fator = -0.1
+            # Define um peso para a aposta em função do número de acertos
+            if score >= 12:
+                peso = +2.0
+            elif score == 11:
+                peso = +1.2
+            elif score == 10:
+                peso = +0.8
+            elif score == 9:
+                peso = +0.4
+            elif score == 8:
+                peso = 0.0  # neutro
+            elif score == 7:
+                peso = -0.4
+            else:  # 0–6
+                peso = -0.7
 
-            for d in dez:
+            # Atualiza reward por dezena participante desta aposta
+            for d in dez_set:
                 if 1 <= d <= 25:
-                    bias[d] = bias.get(d, 0.0) + fator * alpha_new
+                    reward[d] += peso
 
-        # Normaliza o viés para manter escala controlada
+            # Atualiza stats boas/ruins por dezena
+            is_good = score >= 11
+            is_bad = score <= 7
+            for d in dez_set:
+                if 1 <= d <= 25:
+                    st = self.state.stats_num.setdefault(
+                        d, {"hits": 0, "miss": 0, "good": 0, "bad": 0}
+                    )
+                    if is_good:
+                        st["good"] += 1
+                    if is_bad:
+                        st["bad"] += 1
+
+        # ---------------- Converte reward + stats em novo bias ----------------
+        bias = dict(self.state.bias_num)
+        eta = 0.5 * alpha_new  # taxa de aprendizado efetiva
+
+        # Evita divisor zero
+        total_concursos = max(1, len(self.state.history))
+
+        for d in range(1, 26):
+            st = self.state.stats_num.setdefault(
+                d, {"hits": 0, "miss": 0, "good": 0, "bad": 0}
+            )
+
+            # Taxa de acerto global (hit-rate)
+            hit_rate = st["hits"] / total_concursos
+
+            # Desempenho em apostas boas/ruins
+            good_bad_total = max(1, st["good"] + st["bad"])
+            good_rate = st["good"] / good_bad_total
+
+            # Score combinado desta dezena
+            #   reward_lote  → efeito imediato do último concurso
+            #   hit_rate     → tendência de aparecer nos oficiais
+            #   good_rate    → tendência de aparecer nas apostas boas
+            combined = (
+                reward[d]
+                + 4.0 * hit_rate  # peso moderado
+                + 3.0 * good_rate
+            )
+
+            old = bias.get(d, 0.0)
+            new = (1.0 - eta) * old + eta * combined
+            bias[d] = float(new)
+
+        # Normaliza bias para ficar aproximadamente em [-1, 1]
+        values = list(bias.values()) or [0.0]
+        media_bias = sum(values) / len(values)
+        for d in bias:
+            bias[d] -= media_bias
+
         max_abs = max((abs(v) for v in bias.values()), default=0.0)
         if max_abs > 0:
-            coef = 1.0 / max_abs
-            for d in list(bias.keys()):
-                bias[d] = float(bias[d] * coef)
+            fator = 1.0 / max_abs
+            for d in bias:
+                bias[d] = float(bias[d] * fator)
 
         self.state.bias_num = bias
 
-        # Registra metadados do aprendizado
+        # ---------------- Meta / Telemetria ----------------
         meta_aprend = self.state.meta.get("aprendizado", [])
-        if not isinstance(meta_aprend, list):
-            meta_aprend = []
-
         meta_aprend.append(
             {
                 "tag": tag,
@@ -429,10 +606,9 @@ class LearningCore:
         )
         self.state.meta["aprendizado"] = meta_aprend[-200:]
 
-        # Persiste tudo (JSON local + GitHub se configurado)
         self._salvar()
 
-        lote_bom = topk >= alvo_topk
+        lote_bom = topk >= self.cfg.alvo_topk
 
         return {
             "melhor": melhor,
