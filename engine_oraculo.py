@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 import random
+import hashlib
 from dataclasses import dataclass
 from typing import List, Dict, Tuple
 
@@ -11,6 +12,14 @@ N_UNIVERSO = 25
 N_DEZENAS = 15
 OVERLAP_MAX_DEFAULT = 11
 
+
+
+def deterministic_seed(base_dezenas: List[int], version: str = "mestre_v2", salt: str = "lotofacil") -> int:
+    """Gera um seed determinístico (mesma base => mesmo seed) para garantir reprodutibilidade."""
+    base = ",".join(str(int(x)) for x in sorted(base_dezenas))
+    payload = f"{salt}|{version}|{base}".encode("utf-8")
+    h = hashlib.sha256(payload).hexdigest()
+    return int(h[:16], 16)
 
 def max_seq(dezenas: List[int]) -> int:
     """Retorna o tamanho da maior sequência consecutiva em uma aposta."""
