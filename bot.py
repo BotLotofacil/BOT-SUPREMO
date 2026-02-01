@@ -1,6 +1,8 @@
 from __future__ import annotations
 import logging
 import os
+import json
+import json
 from typing import List, Dict, Set
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -14,7 +16,7 @@ from telegram.ext import (
     filters,
 )
 
-from engine_oraculo import OraculoEngine, EngineConfig, shape_ok_mestre, paridade, max_seq
+from engine_oraculo_v2 import OraculoEngine, EngineConfig, shape_ok_mestre, paridade, max_seq, deterministic_seed
 from learning import LearningCore, LearnConfig, _hits
 
 # --------------------------- Configuração ---------------------------
@@ -31,6 +33,19 @@ HISTORY_PATH = os.environ.get("HISTORY_PATH", "data/history.csv")
 
 # Caminho do arquivo de estado de aprendizado (deve apontar para um volume no Railway)
 LEARN_STATE_PATH = os.environ.get("LEARN_STATE_PATH", "data/learn_state.json")
+
+# Persistência do último lote (sobrevive restart)
+LAST_BATCH_PATH = os.environ.get("LAST_BATCH_PATH", "data/last_batch.json")
+# Persistência de "último resultado visto" para auto-alert/auto-train
+LAST_SEEN_PATH = os.environ.get("LAST_SEEN_PATH", "data/last_seen.json")
+# Auditoria (1 evento por linha)
+AUDIT_LOG_PATH = os.environ.get("AUDIT_LOG_PATH", "data/audit_log.jsonl")
+
+# Automação estilo Lotomania
+AUTO_ALERT_ON_NEW_RESULT = os.environ.get("AUTO_ALERT_ON_NEW_RESULT", "1") == "1"
+AUTO_TRAIN_ON_NEW_RESULT = os.environ.get("AUTO_TRAIN_ON_NEW_RESULT", "0") == "1"
+ALERT_CHAT_ID = os.environ.get("ALERT_CHAT_ID", "").strip()
+RESULT_CHECK_INTERVAL_SEC = float(os.environ.get("RESULT_CHECK_INTERVAL_SEC", "300"))
 
 # Admin fixo (não depende de variável de ambiente)
 # Somente este ID terá acesso aos comandos administrativos
@@ -69,6 +84,168 @@ WHITELIST_IDS: Set[int] = carregar_whitelist(WHITELIST_PATH)
 LAST_APOSTAS: List[List[int]] = []
 # Base (último resultado do history) usada para gerar esse lote
 LAST_BASE: List[int] = []
+
+
+# ------------------------ Persistência / Auditoria ------------------------
+
+def _ensure_parent_dir(path: str) -> None:
+    try:
+        d = os.path.dirname(path) or "."
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _load_last_batch() -> dict:
+    try:
+        if os.path.exists(LAST_BATCH_PATH):
+            with open(LAST_BATCH_PATH, "r", encoding="utf-8") as f:
+                return json.load(f) or {}
+    except Exception:
+        return {}
+    return {}
+
+
+def _save_last_batch(base: List[int], apostas: List[List[int]]) -> None:
+    try:
+        _ensure_parent_dir(LAST_BATCH_PATH)
+        payload = {
+            "ts": datetime.now(ZoneInfo(TIMEZONE)).isoformat(timespec="seconds"),
+            "base": list(base),
+            "apostas": [list(a) for a in apostas],
+            "algo": "mestre_v2",
+        }
+        with open(LAST_BATCH_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _append_audit(event: dict) -> None:
+    try:
+        _ensure_parent_dir(AUDIT_LOG_PATH)
+        event = dict(event)
+        event.setdefault("ts", datetime.now(ZoneInfo(TIMEZONE)).isoformat(timespec="seconds"))
+        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _get_latest_key_from_history_csv(path: str) -> tuple[str, List[int]]:
+    """
+    Retorna (chave_ultimo, dezenas_ultimo) a partir do history.csv.
+
+    Como seu history.csv não tem 'concurso/data', usamos:
+      key = "dezenas:02-03-..."
+    e consideramos o ÚLTIMO concurso como a PRIMEIRA linha de dados (mais recente primeiro).
+
+    Também ignora tudo depois de ';' (proteção caso alguém cole texto no final da linha).
+    """
+    if not os.path.exists(path):
+        return ("", [])
+
+    def parse_line(line: str) -> List[int]:
+        line = (line or "").split(";", 1)[0].strip()
+        if not line:
+            return []
+        parts = [p.strip() for p in line.split(",") if p.strip() != ""]
+        if len(parts) < 15:
+            return []
+        try:
+            nums = [int(x) for x in parts[-15:]]
+        except Exception:
+            return []
+        nums = [n for n in nums if 1 <= n <= 25]
+        if len(nums) != 15:
+            return []
+        nums = sorted(set(nums))
+        return nums if len(nums) == 15 else []
+
+    with open(path, "r", encoding="utf-8") as f:
+        raw_lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+
+    if not raw_lines:
+        return ("", [])
+
+    start_idx = 0
+    if len(parse_line(raw_lines[0])) != 15:
+        start_idx = 1
+    if start_idx >= len(raw_lines):
+        return ("", [])
+
+    dezenas = parse_line(raw_lines[start_idx])
+    if len(dezenas) != 15:
+        return ("", [])
+
+    key = "dezenas:" + "-".join(f"{d:02d}" for d in dezenas)
+    return (key, dezenas)
+
+
+def _read_last_seen_key() -> str:
+    try:
+        if os.path.exists(LAST_SEEN_PATH):
+            with open(LAST_SEEN_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            return str(data.get("last_seen_key", "")).strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _write_last_seen_key(key: str) -> None:
+    try:
+        _ensure_parent_dir(LAST_SEEN_PATH)
+        payload = {"last_seen_key": key, "ts": datetime.now(ZoneInfo(TIMEZONE)).isoformat(timespec="seconds")}
+        with open(LAST_SEEN_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+async def _alert_and_train_if_new_result(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Job periódico (estilo Lotomania): se detectar resultado novo no history.csv, alerta e treina."""
+    key, dezenas = _get_latest_key_from_history_csv(HISTORY_PATH)
+    if not key or len(dezenas) != 15:
+        return
+
+    last_seen = _read_last_seen_key()
+
+    # primeira execução: só marca (não alerta)
+    if not last_seen:
+        _write_last_seen_key(key)
+        _append_audit({"event": "bootstrap_last_seen", "key": key, "dezenas": dezenas})
+        return
+
+    if key == last_seen:
+        return
+
+    # mudou => novo resultado
+    _write_last_seen_key(key)
+
+    # alerta
+    if AUTO_ALERT_ON_NEW_RESULT and ALERT_CHAT_ID:
+        try:
+            txt = "📢 <b>Novo resultado detectado no histórico!</b>\n" + " ".join(f"{d:02d}" for d in dezenas)
+            await context.bot.send_message(chat_id=int(ALERT_CHAT_ID), text=txt, parse_mode="HTML")
+        except Exception:
+            pass
+
+    # treino automático (se habilitado)
+    learn = LearningCore()
+    batch = _load_last_batch()
+    apostas = batch.get("apostas") or []
+    if AUTO_TRAIN_ON_NEW_RESULT and apostas:
+        try:
+            rel = learn.aprender_com_lote(oficial=dezenas, apostas=apostas, tag="auto_train")
+            _append_audit({"event": "auto_train", "key": key, "resultado": dezenas, "rel": rel})
+        except Exception as e:
+            _append_audit({"event": "auto_train_error", "key": key, "err": str(e)})
+    else:
+        # mesmo sem treino, registramos o oficial para alimentar stats/histórico
+        learn.registrar_resultado_oficial(dezenas)
+        _append_audit({"event": "new_result_no_train", "key": key, "resultado": dezenas})
+
 
 # ------------------------ Segurança / Avisos / Bloqueios ------------------------
 
@@ -181,54 +358,52 @@ async def _registrar_infracao(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 def carregar_historico(path: str) -> List[List[int]]:
     """
-    Carrega um history.csv simples, sem assumir forma fixa:
-    - Se a primeira linha NÃO for dezenas válidas (1–25), trata como cabeçalho
-    - Caso contrário, considera que já é um resultado
-    - Cada linha deve ter pelo menos 15 colunas; usamos sempre as 15 últimas
+    Carrega um history.csv no formato *simples* (como o seu):
+
+    - Cada linha: 15 dezenas separadas por vírgula (pode ter espaços).
+      Ex.: 2,3,4,6,7,8,9,11,16,17,20,21,23,24,25
+    - Ignora tudo depois de ';' (proteção contra anotações acidentais).
+    - Se a primeira linha não tiver 15 dezenas válidas (1..25), trata como cabeçalho.
+    - IMPORTANTE: o seu arquivo está em ordem "mais recente primeiro".
     """
-    import csv
     import os
 
     if not os.path.exists(path):
         return []
 
-    hist: List[List[int]] = []
+    def parse_line(line: str) -> List[int]:
+        line = (line or "").split(";", 1)[0].strip()
+        if not line:
+            return []
+        parts = [p.strip() for p in line.split(",") if p.strip() != ""]
+        if len(parts) < 15:
+            return []
+        try:
+            nums = [int(x) for x in parts[-15:]]
+        except Exception:
+            return []
+        nums = [n for n in nums if 1 <= n <= 25]
+        if len(nums) != 15:
+            return []
+        # garante unicidade
+        nums = sorted(set(nums))
+        return nums if len(nums) == 15 else []
 
     with open(path, "r", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        rows = [row for row in reader if row]  # ignora linhas totalmente vazias
+        raw_lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
 
-    if not rows:
+    if not raw_lines:
         return []
 
-    def linha_eh_dezenas(row: List[str]) -> bool:
-        """Retorna True se a linha parecer ser um resultado válido da Lotofácil."""
-        if len(row) < 15:
-            return False
-        dezenas_raw = row[-15:]
-        try:
-            dezenas = [int(x) for x in dezenas_raw]
-        except Exception:
-            return False
-        return all(1 <= d <= 25 for d in dezenas)
-
-    # Detecta se a primeira linha é cabeçalho ou já é um resultado
+    # cabeçalho?
     start_idx = 0
-    if not linha_eh_dezenas(rows[0]):
-        # primeira linha é cabeçalho → começamos da linha 2
+    if len(parse_line(raw_lines[0])) != 15:
         start_idx = 1
 
-    for row in rows[start_idx:]:
-        if len(row) < 15:
-            continue
-        dezenas_raw = row[-15:]
-        try:
-            dezenas = [int(x) for x in dezenas_raw]
-        except Exception:
-            continue
-        dezenas = [d for d in dezenas if 1 <= d <= 25]
+    hist: List[List[int]] = []
+    for ln in raw_lines[start_idx:]:
+        dezenas = parse_line(ln)
         if len(dezenas) == 15:
-            dezenas = sorted(dezenas)
             hist.append(dezenas)
 
     return hist
@@ -375,7 +550,8 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         # Sempre pedimos EXACT 10 apostas
-        apostas = engine.gerar_lote(ultimo_resultado=ultimo, qtd=10)
+        seed = deterministic_seed(ultimo, version="mestre_v2", salt="lotofacil")
+        apostas = engine.gerar_lote(ultimo_resultado=ultimo, qtd=10, seed=seed)
     except Exception as e:
         logger.error("Erro no OraculoEngine.gerar_lote: %s", e, exc_info=True)
         if loading is not None:
@@ -418,6 +594,8 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global LAST_APOSTAS, LAST_BASE
     LAST_APOSTAS = [list(a) for a in apostas]
     LAST_BASE = list(ultimo)
+    _save_last_batch(base=LAST_BASE, apostas=LAST_APOSTAS)
+    _append_audit({"event": "gerar", "base": LAST_BASE, "seed": seed, "qtd": len(LAST_APOSTAS)})
 
     await _set_progress(0.95, "Formatando resposta...")
 
@@ -493,10 +671,16 @@ async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     dezenas = sorted(dezenas)
 
-    # Garante que existe um lote anterior
+    # Garante que existe um lote anterior (memória ou disco)
+    global LAST_APOSTAS, LAST_BASE
+    if not LAST_APOSTAS:
+        batch = _load_last_batch()
+        if batch.get("apostas"):
+            LAST_APOSTAS = [list(a) for a in batch.get("apostas")]
+            LAST_BASE = list(batch.get("base") or [])
     if not LAST_APOSTAS:
         return await update.message.reply_text(
-            "⚠️ Ainda não há lote em memória.\n"
+            "⚠️ Ainda não há lote disponível (memória/disco).\n"
             "Use primeiro o comando /gerar para o bot ter apostas para analisar."
         )
 
@@ -630,6 +814,40 @@ async def lista_bloqueados(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text(msg, parse_mode="HTML")
 
 
+
+# --------------------------------------------------------
+# /status — mostra estado do bot (admin: completo, user: básico)
+# --------------------------------------------------------
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    user_id = user.id if user else 0
+
+    learn = LearningCore()
+    alpha = learn.get_alpha()
+    bias_num = learn.get_bias_num() or {}
+    last_seen = _read_last_seen_key()
+    batch = _load_last_batch()
+
+    linhas: List[str] = []
+    linhas.append("📡 <b>STATUS — Lotofácil Oráculo (Mestre v2)</b>\n")
+    linhas.append(f"• Auto-alert: <b>{'ON' if AUTO_ALERT_ON_NEW_RESULT else 'OFF'}</b>")
+    linhas.append(f"• Auto-train: <b>{'ON' if AUTO_TRAIN_ON_NEW_RESULT else 'OFF'}</b>")
+    linhas.append(f"• Alpha: <b>{alpha:.3f}</b>")
+    linhas.append(f"• Último visto (key): <code>{last_seen or '—'}</code>")
+    linhas.append(f"• Último lote salvo: <b>{'SIM' if batch.get('apostas') else 'NÃO'}</b>")
+
+    if _is_admin(user_id) and bias_num:
+        itens = sorted(bias_num.items(), key=lambda kv: kv[1], reverse=True)
+        top_pos = itens[:5]
+        top_neg = sorted(itens, key=lambda kv: kv[1])[:5]
+        fmt = lambda lst: ", ".join(f"{int(d):02d}({v:+.3f})" for d, v in lst)
+        linhas.append("\n<b>Top vieses +</b>: " + fmt(top_pos))
+        linhas.append("<b>Top vieses -</b>: " + fmt(top_neg))
+
+    await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
+
+
 # --------------------------------------------------------
 # /debug_state — ADMIN: inspeciona estado de aprendizado
 # --------------------------------------------------------
@@ -719,10 +937,17 @@ def main() -> None:
     app.add_handler(CommandHandler("confirmar", confirmar))
     app.add_handler(CommandHandler("desbloquear", desbloquear))
     app.add_handler(CommandHandler("lista_bloqueados", lista_bloqueados))
+    app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("debug_state", debug_state))
 
     # Qualquer mensagem que NÃO seja comando cai aqui (segurança máxima)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, anti_abuso_handler))
+
+    # Job periódico: detecta resultado novo no history.csv e aplica ciclo auto-alert/auto-train
+    try:
+        app.job_queue.run_repeating(_alert_and_train_if_new_result, interval=RESULT_CHECK_INTERVAL_SEC, first=10)
+    except Exception as e:
+        logger.error("Falha ao agendar watcher de resultado: %s", e)
 
     logger.info("Bot iniciado. Aguardando comandos...")
     app.run_polling(close_loop=False)
