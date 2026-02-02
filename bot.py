@@ -285,23 +285,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     uid = user.id if user else 0
 
+    # Se quiser permitir /start até para não liberados, remova esta checagem.
     if not _usuario_autorizado(uid):
         return await update.message.reply_text(
             "⛔ Acesso não autorizado.\n"
-            "Use /meuid e envie seu ID para liberação na whitelist."
+            "Use /meuid e envie seu ID ao administrador para liberação."
         )
 
+    # Menu para usuário comum
+    if not _is_admin(uid):
+        return await update.message.reply_text(
+            "✅ Oráculo Lotofácil — Preset Mestre\n\n"
+            "Comandos disponíveis:\n"
+            "/gerar — gera 10 apostas (determinístico)\n"
+            "/meuid — mostra seu ID\n"
+        )
+
+    # Menu para ADMIN (somente admin vê isto)
     return await update.message.reply_text(
-        "✅ Oráculo Lotofácil — Preset Mestre\n"
+        "✅ Oráculo Lotofácil — Preset Mestre (ADMIN)\n\n"
         "Comandos:\n"
         "/gerar — gera 10 apostas (determinístico)\n"
         "/regerar — regenera o mesmo lote da base atual\n"
-        "/status — status do sistema\n\n"
+        "/status — status do sistema\n"
+        "/meuid — mostra seu ID\n\n"
         "Admin:\n"
         "/confirmar <15 dezenas>\n"
         "/resultado <15 dezenas>\n"
-        "/meuid\n"
     )
+
 
 async def meuid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
