@@ -3,20 +3,19 @@ from __future__ import annotations
 """
 bot.py — Oráculo Lotofácil (Preset Mestre) — padrão "Lotomania"
 
-Melhorias (sem quebrar o Preset Mestre):
+Melhorias:
 - Determinismo real: mesma base (último resultado) => mesmo lote, sempre.
-- Persistência do último lote/base em data/last_batch.json (sobrevive restart).
-- Watcher (JobQueue): detecta novo resultado no data/history.csv, alerta e (opcional) treina.
-- Auditoria em JSONL: data/audit_log.jsonl (1 evento por linha).
-- Comandos extras: /status, /resultado (admin), /regerar.
+- Persistência: data/last_batch.json (sobrevive restart).
+- Watcher: detecta novo resultado no data/history.csv, alerta e (opcional) treina.
+- Auditoria: data/audit_log.jsonl (1 evento por linha).
+- Comandos: /status, /resultado (admin), /regerar.
 
-Formato esperado do history.csv:
-- Cada linha: 15 dezenas separadas por vírgula. Ex:
-  2,3,4,6,7,8,9,11,16,17,20,21,23,24,25
-- O bot considera a PRIMEIRA LINHA VÁLIDA como "último resultado".
-- Tudo após ';' é ignorado (proteção contra colagem acidental).
+Compatibilidade JobQueue:
+- Se python-telegram-bot estiver com extra [job-queue], usa JobQueue.
+- Se NÃO estiver, roda watcher via asyncio (fallback), sem quebrar deploy.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -35,7 +34,6 @@ from telegram.ext import (
     filters,
 )
 
-# ✅ nomes corretos conforme seu repo
 from engine_oraculo import OraculoEngine, EngineConfig, shape_ok_mestre, paridade, max_seq
 from learning import LearningCore, LearnConfig
 
@@ -64,7 +62,6 @@ AUTO_TRAIN_ON_NEW_RESULT = os.getenv("AUTO_TRAIN_ON_NEW_RESULT", "0") == "1"
 ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID", "").strip()
 RESULT_CHECK_INTERVAL_SEC = int(os.getenv("RESULT_CHECK_INTERVAL_SEC", "300"))
 
-# Admin fixo (pode sobrescrever por ADMIN_IDS env: "123,456")
 _admin_ids_env = os.getenv("ADMIN_IDS", "").strip()
 if _admin_ids_env:
     try:
@@ -74,17 +71,13 @@ if _admin_ids_env:
 else:
     ADMIN_IDS: Set[int] = {5344714174}
 
-# Whitelist (clientes pagantes) — 1 ID por linha
 WHITELIST_PATH = os.environ.get("WHITELIST_PATH", "whitelist.txt")
 
-# Anti-flood
 COOLDOWN_SECONDS = float(os.getenv("COOLDOWN_SECONDS", "8.0"))
 
-# Determinismo
 SEED_SALT = os.getenv("SEED_SALT", "mestre_lotofacil_salt_v1")
 ALGO_VERSION = os.getenv("ALGO_VERSION", "mestre_v2")
 
-# Engine config (Preset Mestre)
 ENGINE_OVERLAP_MAX = int(os.getenv("ENGINE_OVERLAP_MAX", "11"))
 ENGINE_TARGET_QTD = int(os.getenv("ENGINE_TARGET_QTD", "10"))
 
@@ -92,7 +85,6 @@ ENGINE_TARGET_QTD = int(os.getenv("ENGINE_TARGET_QTD", "10"))
 
 LAST_APOSTAS: List[List[int]] = []
 LAST_BASE: List[int] = []
-
 _last_call_per_user: Dict[Tuple[int, str], float] = {}
 
 # --------------------------- Helpers: filesystem ---------------------------
@@ -273,9 +265,6 @@ def _sig_from_dezenas(dezenas: List[int]) -> str:
 # --------------------------- Deterministic seed ---------------------------
 
 def deterministic_seed(base: List[int]) -> int:
-    """
-    Seed determinístico: base + versão + salt -> int 31 bits
-    """
     base_s = ",".join(f"{d:02d}" for d in sorted(base))
     payload = f"{ALGO_VERSION}|{SEED_SALT}|{base_s}"
     h = hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -310,7 +299,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status — status do sistema\n\n"
         "Admin:\n"
         "/confirmar <15 dezenas>\n"
-        "/resultado <15 dezenas>  (registra no history e dispara ciclo)\n"
+        "/resultado <15 dezenas>\n"
         "/meuid\n"
     )
 
@@ -333,10 +322,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     msg = []
     msg.append("📌 Status — Oráculo Lotofácil (Mestre)")
-    if last:
-        msg.append(f"Último resultado (history[0]): {_format_aposta(last)}")
-    else:
-        msg.append("Último resultado: (histórico vazio)")
+    msg.append(f"Último resultado: {_format_aposta(last) if last else '(histórico vazio)'}")
     msg.append(f"Alpha: {learn.get_alpha():.3f}")
     msg.append(f"Auto-alert: {AUTO_ALERT_ON_NEW_RESULT} | Auto-train: {AUTO_TRAIN_ON_NEW_RESULT} | Intervalo: {RESULT_CHECK_INTERVAL_SEC}s")
     msg.append(f"Last-seen set: {'SIM' if last_seen else 'NÃO'}")
@@ -377,7 +363,6 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         apostas = engine.gerar_lote(ultimo_resultado=base, qtd=ENGINE_TARGET_QTD, seed=seed)
     except TypeError:
-        # fallback caso a assinatura no seu engine seja (base, qtd, seed)
         apostas = engine.gerar_lote(base, qtd=ENGINE_TARGET_QTD, seed=seed)
     except Exception as e:
         logger.error("Erro ao gerar lote: %s", e, exc_info=True)
@@ -386,15 +371,12 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not apostas or len(apostas) != ENGINE_TARGET_QTD:
         return await update.message.reply_text("⚠️ Não foi possível gerar o lote completo dentro das regras.")
 
-    # Persistência + auditoria
     _save_last_batch(apostas, base, seed)
     _append_audit("gerar", {"user_id": uid, "seed": seed, "base": base, "qtd": len(apostas)})
 
-    # Registrar no learning (telemetria leve)
     try:
         learn.registrar_lote_gerado(base=base, apostas=apostas, tag="gerar")
     except TypeError:
-        # fallback se sua função registrar_lote_gerado tiver assinatura diferente
         try:
             learn.registrar_lote_gerado(oficial_base=base, apostas=apostas, tag="gerar")
         except Exception:
@@ -402,7 +384,6 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         pass
 
-    # Resposta detalhada no padrão Mestre
     linhas = []
     linhas.append("🎰 SUAS APOSTAS INTELIGENTES — Preset Mestre 🎰")
     linhas.append(f"Base: {_format_aposta(base)}")
@@ -414,9 +395,11 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         seq = max_seq(a)
         r = len(set(a) & set(base))
         hit = _placar(a, base)
-
         linhas.append(f"Aposta {i}: {_format_aposta(a)}")
-        linhas.append(f"🔢 Pares: {pares} | Ímpares: {imp} | SeqMax: {seq} | {r}R | {hit} acertos (vs. último) | {'✅ OK' if shape_ok_mestre(a) else '🛠️ REVER'}")
+        linhas.append(
+            f"🔢 Pares: {pares} | Ímpares: {imp} | SeqMax: {seq} | {r}R | "
+            f"{hit} acertos (vs. último) | {'✅ OK' if shape_ok_mestre(a) else '🛠️ REVER'}"
+        )
         linhas.append("")
 
     return await update.message.reply_text("\n".join(linhas))
@@ -519,12 +502,6 @@ async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     return await update.message.reply_text("\n".join(linhas))
 
 async def resultado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Admin: registra um resultado no topo do history.csv e dispara ciclo:
-    - atualiza last_seen
-    - alerta
-    - (opcional) treina usando last_batch.json
-    """
     user = update.effective_user
     uid = user.id if user else 0
 
@@ -547,7 +524,6 @@ async def resultado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     oficial = sorted(dezenas)
 
-    # Prepend to history (latest first)
     _ensure_parent_dir(HISTORY_PATH)
     old = ""
     if os.path.exists(HISTORY_PATH):
@@ -563,7 +539,6 @@ async def resultado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     _append_audit("resultado_registrado", {"user_id": uid, "oficial": oficial})
 
-    # Alert (opcional)
     if AUTO_ALERT_ON_NEW_RESULT and ALERT_CHAT_ID:
         try:
             await context.bot.send_message(
@@ -573,7 +548,6 @@ async def resultado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             logger.warning("Falha ao enviar alerta: %s", e)
 
-    # Optional train using last batch
     trained = False
     if AUTO_TRAIN_ON_NEW_RESULT:
         if not LAST_APOSTAS:
@@ -598,66 +572,88 @@ async def resultado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Auto-train: {'✅' if trained else '⏸️ (desligado ou sem lote)'}"
     )
 
-# --------------------------- Watcher (JobQueue) ---------------------------
+# --------------------------- Watcher core ---------------------------
 
-async def _watch_new_result(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _watch_new_result_app(app: Application) -> None:
     """
-    Job periódico:
-    - Lê history.csv
-    - Se o topo (último resultado) mudar em relação ao last_seen, alerta e (opcional) treina.
+    Núcleo do watcher: roda 1 vez (sem depender de JobQueue).
     """
-    try:
-        hist = carregar_historico(HISTORY_PATH)
-        if not hist:
-            return
+    hist = carregar_historico(HISTORY_PATH)
+    if not hist:
+        return
 
-        last = ultimo_resultado(hist)
-        sig = _sig_from_dezenas(last)
-        last_seen = _read_last_seen_sig()
+    last = ultimo_resultado(hist)
+    sig = _sig_from_dezenas(last)
+    last_seen = _read_last_seen_sig()
 
-        # first run: only mark, no spam
-        if not last_seen:
-            _write_last_seen_sig(sig)
-            logger.info("Watcher first-run: marcando last_seen (sem alertar).")
-            return
-
-        if sig == last_seen:
-            return
-
-        # New result detected
+    if not last_seen:
         _write_last_seen_sig(sig)
+        logger.info("Watcher first-run: marcando last_seen (sem alertar).")
+        return
 
-        _append_audit("novo_resultado_detectado", {"oficial": last})
+    if sig == last_seen:
+        return
 
-        # Alert
-        if AUTO_ALERT_ON_NEW_RESULT and ALERT_CHAT_ID:
+    _write_last_seen_sig(sig)
+    _append_audit("novo_resultado_detectado", {"oficial": last})
+
+    if AUTO_ALERT_ON_NEW_RESULT and ALERT_CHAT_ID:
+        try:
+            await app.bot.send_message(
+                chat_id=int(ALERT_CHAT_ID),
+                text=f"📣 Novo resultado detectado no history.csv:\n{_format_aposta(last)}",
+            )
+        except Exception as e:
+            logger.warning("Falha ao enviar alerta: %s", e)
+
+    if AUTO_TRAIN_ON_NEW_RESULT:
+        if not LAST_APOSTAS:
+            _load_last_batch()
+        if LAST_APOSTAS:
+            learn = LearningCore(LearnConfig(state_path=LEARN_STATE_PATH))
             try:
-                await context.bot.send_message(
-                    chat_id=int(ALERT_CHAT_ID),
-                    text=f"📣 Novo resultado detectado no history.csv:\n{_format_aposta(last)}",
-                )
+                rel = learn.aprender_com_lote(oficial=last, apostas=LAST_APOSTAS, tag="auto_train(watcher)")
+                _append_audit("auto_train", {
+                    "oficial": last,
+                    "melhor": rel.get("melhor"),
+                    "media": rel.get("media"),
+                    "alpha": rel.get("alpha"),
+                })
             except Exception as e:
-                logger.warning("Falha ao enviar alerta: %s", e)
+                logger.error("Auto-train watcher falhou: %s", e, exc_info=True)
 
-        # Auto-train (opcional)
-        if AUTO_TRAIN_ON_NEW_RESULT:
-            if not LAST_APOSTAS:
-                _load_last_batch()
-            if LAST_APOSTAS:
-                learn = LearningCore(LearnConfig(state_path=LEARN_STATE_PATH))
-                try:
-                    rel = learn.aprender_com_lote(oficial=last, apostas=LAST_APOSTAS, tag="auto_train(watcher)")
-                    _append_audit("auto_train", {
-                        "oficial": last,
-                        "melhor": rel.get("melhor"),
-                        "media": rel.get("media"),
-                        "alpha": rel.get("alpha"),
-                    })
-                except Exception as e:
-                    logger.error("Auto-train watcher falhou: %s", e, exc_info=True)
+async def _watch_loop(app: Application) -> None:
+    """
+    Fallback quando não há JobQueue: loop asyncio.
+    """
+    await asyncio.sleep(10)
+    while True:
+        try:
+            await _watch_new_result_app(app)
+        except Exception as e:
+            logger.error("Watcher(loop) erro: %s", e, exc_info=True)
+        await asyncio.sleep(max(5, int(RESULT_CHECK_INTERVAL_SEC)))
 
-    except Exception as e:
-        logger.error("Watcher erro: %s", e, exc_info=True)
+async def _post_init(application: Application) -> None:
+    """
+    Roda ao iniciar o app:
+    - Tenta agendar via JobQueue se existir
+    - Senão cria task asyncio (fallback)
+    """
+    if RESULT_CHECK_INTERVAL_SEC <= 0:
+        return
+
+    jq = getattr(application, "job_queue", None)
+    if jq is not None:
+        try:
+            jq.run_repeating(lambda ctx: _watch_new_result_app(application), interval=RESULT_CHECK_INTERVAL_SEC, first=10)
+            logger.info("Watcher agendado via JobQueue.")
+            return
+        except Exception as e:
+            logger.warning("Falha ao agendar via JobQueue, usando fallback asyncio: %s", e)
+
+    application.create_task(_watch_loop(application))
+    logger.info("Watcher agendado via asyncio fallback (sem JobQueue).")
 
 # --------------------------- Generic handler ---------------------------
 
@@ -670,7 +666,7 @@ def build_app() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN não configurado.")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("meuid", meuid))
@@ -682,14 +678,9 @@ def build_app() -> Application:
 
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    # JobQueue watcher
-    if RESULT_CHECK_INTERVAL_SEC > 0:
-        app.job_queue.run_repeating(_watch_new_result, interval=RESULT_CHECK_INTERVAL_SEC, first=10)
-
     return app
 
 def main() -> None:
-    # Restore last batch if exists (so /confirmar and watcher can train after restart)
     _load_last_batch()
 
     app = build_app()
