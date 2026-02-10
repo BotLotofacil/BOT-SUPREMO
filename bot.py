@@ -34,7 +34,7 @@ from telegram.ext import (
     filters,
 )
 
-from engine_oraculo_patched import OraculoEngine, EngineConfig, shape_ok_mestre, paridade, max_seq
+from engine_oraculo import OraculoEngine, EngineConfig, shape_ok_mestre, paridade, max_seq
 from learning import LearningCore, LearnConfig
 
 # --------------------------- Logging ---------------------------
