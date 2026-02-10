@@ -75,10 +75,14 @@ class EngineConfig:
 
     # plano base de repetição R (quantidade de dezenas repetidas do último resultado)
     # Usado ciclicamente conforme o índice da aposta no lote.
+    
     base_R_plan: Tuple[int, ...] = (
+        # ciclo de 10 (Preset Mestre): 8R=1x, 11R=1x, resto 9R–10R
         10, 9, 9, 10, 10,
-        9, 10, 8, 11, 11,
-        10, 9, 11, 8, 10,
+        9, 10, 9, 8, 11,
+        # repete o ciclo para alimentar o pool (determinístico)
+        10, 9, 9, 10, 10,
+        9, 10, 9, 8, 11,
     )
 
     # -------------------------------
@@ -287,8 +291,8 @@ class OraculoEngine:
 
         # roles controlam quanta preferência ao complemento
         if role == "contrarian":
-            # puxa mais do complemento (menos repetição real)
-            R_target = max(7, min(9, R_target))
+            # contrarian NÃO pode quebrar o Preset Mestre: mínimo 8R
+            R_target = max(8, min(9, R_target))
         elif role == "aggressive":
             R_target = max(10, min(12, R_target))
         else:
@@ -389,6 +393,19 @@ class OraculoEngine:
         need_aggressive = 1  # pelo menos 1 jogo agressivo (11R-ish)
         # o resto se ajusta no greedy
 
+
+        # quotas de repetição (Preset Mestre): 1x 8R, 1x 11R, resto 9R–10R
+        target_R = {8: 1, 9: 4, 10: 4, 11: 1}
+        r_count = {8: 0, 9: 0, 10: 0, 11: 0}
+
+        def _r_penalty(r: int) -> float:
+            # penaliza forte ultrapassar a quota para evitar "deslizar" para 6R/7R ou excesso de 8R/11R
+            if r not in target_R:
+                return 5.0
+            if r_count[r] >= target_R[r]:
+                return 2.5
+            return 0.0
+
         # greedy determinístico: a cada passo escolhe o candidato que maximiza:
         # score_base + coverage_reward*(novas de C) - overlap_penalty*(overlaps)
         for step in range(qtd):
@@ -420,6 +437,11 @@ class OraculoEngine:
                 if hard_violation:
                     continue
 
+                # guarda Preset Mestre: não permitir R < 8 (evita 6R/7R no bloco final)
+                if cand.R < 8 or cand.R > 11:
+                    continue
+                r_pen = _r_penalty(cand.R)
+
                 # penalidade soft por overlaps altos
                 ov_pen = 0.0
                 for cs in chosen_sets:
@@ -437,6 +459,7 @@ class OraculoEngine:
                     + self.config.coverage_reward * (new_cov * 5.0)
                     - self.config.overlap_penalty * (ov_pen)
                     - role_pen
+                    - r_pen
                 )
 
                 if score > best_score:
@@ -447,6 +470,9 @@ class OraculoEngine:
                 break
 
             chosen.append(best)
+            if best.R in r_count:
+                r_count[best.R] += 1
+
             chosen_sets.append(set(best.dezenas))
             covered_C |= (set(best.dezenas) & set(C))
 
@@ -460,12 +486,16 @@ class OraculoEngine:
             for cand in candidates:
                 if len(chosen) >= qtd:
                     break
+                if cand.R < 8 or cand.R > 11:
+                    continue
                 s = set(cand.dezenas)
                 if any(len(s & cs) > self.config.overlap_max for cs in chosen_sets):
                     continue
                 if cand in chosen:
                     continue
                 chosen.append(cand)
+                if cand.R in r_count:
+                    r_count[cand.R] += 1
                 chosen_sets.append(s)
                 covered_C |= (s & set(C))
 
