@@ -75,6 +75,13 @@ WHITELIST_PATH = os.environ.get("WHITELIST_PATH", "whitelist.txt")
 
 COOLDOWN_SECONDS = float(os.getenv("COOLDOWN_SECONDS", "8.0"))
 
+# Se quiser "limpar" a mensagem e mostrar só as apostas:
+# - SHOW_PORTFOLIO_SUMMARY=0 remove o resumo (cobertura/overlap) antes das apostas
+# - SHOW_BET_DETAILS=0 remove as linhas de pares/ímpares/seq/R/acertos abaixo de cada aposta
+SHOW_PORTFOLIO_SUMMARY = os.getenv("SHOW_PORTFOLIO_SUMMARY", "1").strip() not in ("0", "false", "False")
+SHOW_BET_DETAILS = os.getenv("SHOW_BET_DETAILS", "1").strip() not in ("0", "false", "False")
+
+
 SEED_SALT = os.getenv("SEED_SALT", "mestre_lotofacil_salt_v1")
 ALGO_VERSION = os.getenv("ALGO_VERSION", "mestre_v2")
 
@@ -400,31 +407,33 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     linhas.append("🎰 SUAS APOSTAS INTELIGENTES — Preset Mestre 🎰")
     linhas.append(f"Base: {_format_aposta(base)}")
     linhas.append(f"Seed determinístico: {seed}")
+        # Resumo do portfólio (anti-colapso)
+    if SHOW_PORTFOLIO_SUMMARY:
     # Resumo do portfólio (anti-colapso): cobertura do complemento + overlaps
-    try:
-        universo = set(range(1, 26))
-        comp = sorted(list(universo - set(base)))  # 10 ausentes do último resultado
-        cov_comp = set()
-        for a in apostas:
-            cov_comp |= (set(a) & set(comp))
-        missing = sorted(list(set(comp) - cov_comp))
+        try:
+            universo = set(range(1, 26))
+            comp = sorted(list(universo - set(base)))  # 10 ausentes do último resultado
+            cov_comp = set()
+            for a in apostas:
+                cov_comp |= (set(a) & set(comp))
+            missing = sorted(list(set(comp) - cov_comp))
 
-        # overlaps
-        max_ov = 0
-        min_ov = 99
-        for i in range(len(apostas)):
-            for j in range(i + 1, len(apostas)):
-                ov = len(set(apostas[i]) & set(apostas[j]))
-                max_ov = max(max_ov, ov)
-                min_ov = min(min_ov, ov)
-        if min_ov == 99:
-            min_ov = 0
+            # overlaps
+            max_ov = 0
+            min_ov = 99
+            for i in range(len(apostas)):
+                for j in range(i + 1, len(apostas)):
+                    ov = len(set(apostas[i]) & set(apostas[j]))
+                    max_ov = max(max_ov, ov)
+                    min_ov = min(min_ov, ov)
+            if min_ov == 99:
+                min_ov = 0
 
-        linhas.append(f"🧩 Cobertura do complemento (10 ausentes): {len(cov_comp)}/10" + (f" | Faltando: {_format_aposta(missing)}" if missing else " | ✅ Completo"))
-        linhas.append(f"🧷 Overlap entre apostas: min={min_ov} | max={max_ov} (hard≤{engine.config.overlap_max})")
-        linhas.append("")
-    except Exception:
-        pass
+            linhas.append(f"🧩 Cobertura do complemento (10 ausentes): {len(cov_comp)}/10" + (f" | Faltando: {_format_aposta(missing)}" if missing else " | ✅ Completo"))
+            linhas.append(f"🧷 Overlap entre apostas: min={min_ov} | max={max_ov} (hard≤{engine.config.overlap_max})")
+            linhas.append("")
+        except Exception:
+            pass
 
     linhas.append("")
 
@@ -434,10 +443,11 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         r = len(set(a) & set(base))
         hit = _placar(a, base)
         linhas.append(f"Aposta {i}: {_format_aposta(a)}")
-        linhas.append(
-            f"🔢 Pares: {pares} | Ímpares: {imp} | SeqMax: {seq} | {r}R | "
-            f"{hit} acertos (vs. último) | {'✅ OK' if shape_ok_mestre(a) else '🛠️ REVER'}"
-        )
+        if SHOW_BET_DETAILS:
+            linhas.append(
+                f"🔢 Pares: {pares} | Ímpares: {imp} | SeqMax: {seq} | {r}R | "
+                f"{hit} acertos (vs. último) | {'✅ OK' if shape_ok_mestre(a) else '🛠️ REVER'}"
+            )
         linhas.append("")
 
     return await update.message.reply_text("\n".join(linhas))
