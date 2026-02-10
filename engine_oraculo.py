@@ -91,13 +91,13 @@ class EngineConfig:
     use_portfolio_optimizer: bool = True
 
     # tamanho do pool de candidatos (determinístico) para selecionar o bloco final
-    candidate_pool_size: int = 1200  # 300–2000 é um bom range
+    candidate_pool_size: int = 1600  # 300–2000 é um bom range
 
     # penalidade por sobreposição no score (além do hard overlap_max)
-    overlap_soft_max: int = 10  # acima disso, penaliza forte (mesmo se <= overlap_max)
+    overlap_soft_max: int = 9  # acima disso, penaliza forte (mesmo se <= overlap_max)
 
     # peso da penalidade por overlap (quanto maior, mais diversidade)
-    overlap_penalty: float = 0.55
+    overlap_penalty: float = 0.70
 
     # recompensa por cobrir dezenas do complemento (ausentes do último resultado)
     coverage_reward: float = 0.85
@@ -106,7 +106,7 @@ class EngineConfig:
     require_full_complement_coverage: bool = True
 
     # reforço: garante pelo menos N jogos "contrarian" (mais complemento / menor R)
-    contrarian_games: int = 2
+    contrarian_games: int = 3
 
 
 @dataclass(frozen=True)
