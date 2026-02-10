@@ -13,6 +13,13 @@ Melhorias:
 Compatibilidade JobQueue:
 - Se python-telegram-bot estiver com extra [job-queue], usa JobQueue.
 - Se NÃO estiver, roda watcher via asyncio (fallback), sem quebrar deploy.
+
+✅ Patch 2026-02-10 — /regerar VARIANTE (auditável)
+- Adiciona data/regen_state.json para guardar contador por base (sig do último resultado).
+- last_batch.json passa a guardar regen_id.
+- /gerar fixa regen_id=0 (lote canônico).
+- /regerar incrementa regen_id (ou aceita /regerar <n>) e muda o seed,
+  gerando um lote DIFERENTE porém totalmente reproduzível.
 """
 
 import asyncio
@@ -57,6 +64,9 @@ LAST_BATCH_PATH = os.environ.get("LAST_BATCH_PATH", "data/last_batch.json")
 LAST_SEEN_PATH = os.environ.get("LAST_SEEN_PATH", "data/last_seen.json")
 AUDIT_LOG_PATH = os.environ.get("AUDIT_LOG_PATH", "data/audit_log.jsonl")
 
+# ✅ NOVO: estado do /regerar por base
+REGEN_STATE_PATH = os.environ.get("REGEN_STATE_PATH", "data/regen_state.json")
+
 AUTO_ALERT_ON_NEW_RESULT = os.getenv("AUTO_ALERT_ON_NEW_RESULT", "1") == "1"
 AUTO_TRAIN_ON_NEW_RESULT = os.getenv("AUTO_TRAIN_ON_NEW_RESULT", "0") == "1"
 ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID", "").strip()
@@ -75,13 +85,6 @@ WHITELIST_PATH = os.environ.get("WHITELIST_PATH", "whitelist.txt")
 
 COOLDOWN_SECONDS = float(os.getenv("COOLDOWN_SECONDS", "8.0"))
 
-# Se quiser "limpar" a mensagem e mostrar só as apostas:
-# - SHOW_PORTFOLIO_SUMMARY=0 remove o resumo (cobertura/overlap) antes das apostas
-# - SHOW_BET_DETAILS=0 remove as linhas de pares/ímpares/seq/R/acertos abaixo de cada aposta
-SHOW_PORTFOLIO_SUMMARY = os.getenv("SHOW_PORTFOLIO_SUMMARY", "1").strip() not in ("0", "false", "False")
-SHOW_BET_DETAILS = os.getenv("SHOW_BET_DETAILS", "1").strip() not in ("0", "false", "False")
-
-
 SEED_SALT = os.getenv("SEED_SALT", "mestre_lotofacil_salt_v1")
 ALGO_VERSION = os.getenv("ALGO_VERSION", "mestre_v2")
 
@@ -92,6 +95,8 @@ ENGINE_TARGET_QTD = int(os.getenv("ENGINE_TARGET_QTD", "10"))
 
 LAST_APOSTAS: List[List[int]] = []
 LAST_BASE: List[int] = []
+LAST_REGEN_ID: int = 0  # ✅ NOVO: regen_id do último lote carregado/gerado
+
 _last_call_per_user: Dict[Tuple[int, str], float] = {}
 
 # --------------------------- Helpers: filesystem ---------------------------
@@ -117,13 +122,16 @@ def _append_audit(event: str, payload: dict) -> None:
     except Exception as e:
         logger.warning("Falha ao escrever auditoria: %s", e)
 
-def _save_last_batch(apostas: List[List[int]], base: List[int], seed: int) -> None:
-    global LAST_APOSTAS, LAST_BASE
+def _save_last_batch(apostas: List[List[int]], base: List[int], seed: int, regen_id: int = 0) -> None:
+    global LAST_APOSTAS, LAST_BASE, LAST_REGEN_ID
     LAST_APOSTAS = [sorted([int(x) for x in a]) for a in apostas]
     LAST_BASE = sorted([int(x) for x in base])
+    LAST_REGEN_ID = int(regen_id)
+
     data = {
         "ts": _now_iso(),
         "seed": int(seed),
+        "regen_id": int(regen_id),
         "base": LAST_BASE,
         "apostas": LAST_APOSTAS,
         "algo_version": ALGO_VERSION,
@@ -133,7 +141,7 @@ def _save_last_batch(apostas: List[List[int]], base: List[int], seed: int) -> No
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def _load_last_batch() -> bool:
-    global LAST_APOSTAS, LAST_BASE
+    global LAST_APOSTAS, LAST_BASE, LAST_REGEN_ID
     try:
         if not os.path.exists(LAST_BATCH_PATH):
             return False
@@ -162,6 +170,10 @@ def _load_last_batch() -> bool:
 
         LAST_BASE = base
         LAST_APOSTAS = cleaned
+
+        regen_id = int(data.get("regen_id", 0))
+        LAST_REGEN_ID = regen_id
+
         return True
     except Exception as e:
         logger.warning("Falha ao carregar last_batch: %s", e)
@@ -181,6 +193,26 @@ def _write_last_seen_sig(sig: str) -> None:
     _ensure_parent_dir(LAST_SEEN_PATH)
     with open(LAST_SEEN_PATH, "w", encoding="utf-8") as f:
         json.dump({"ts": _now_iso(), "sig": sig}, f, ensure_ascii=False, indent=2)
+
+# ✅ NOVO: regen state helpers
+
+def _load_regen_state() -> dict:
+    try:
+        if not os.path.exists(REGEN_STATE_PATH):
+            return {}
+        with open(REGEN_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _save_regen_state(state: dict) -> None:
+    try:
+        _ensure_parent_dir(REGEN_STATE_PATH)
+        with open(REGEN_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning("Falha ao salvar regen_state: %s", e)
 
 # --------------------------- Helpers: security / access ---------------------------
 
@@ -272,8 +304,23 @@ def _sig_from_dezenas(dezenas: List[int]) -> str:
 # --------------------------- Deterministic seed ---------------------------
 
 def deterministic_seed(base: List[int]) -> int:
+    """
+    Seed determinístico padrão (compatibilidade).
+    Mantido para retrocompatibilidade, mas /gerar e /regerar usam deterministic_seed_variant().
+    """
     base_s = ",".join(f"{d:02d}" for d in sorted(base))
     payload = f"{ALGO_VERSION}|{SEED_SALT}|{base_s}"
+    h = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return int(h[:8], 16) & 0x7FFFFFFF
+
+def deterministic_seed_variant(base: List[int], regen_id: int) -> int:
+    """
+    Seed determinístico CONTROLADO:
+    - regen_id=0 => lote canônico (/gerar)
+    - regen_id>=1 => variantes auditáveis (/regerar)
+    """
+    base_s = ",".join(f"{d:02d}" for d in sorted(base))
+    payload = f"{ALGO_VERSION}|{SEED_SALT}|{base_s}|regen:{int(regen_id)}"
     h = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return int(h[:8], 16) & 0x7FFFFFFF
 
@@ -292,14 +339,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     uid = user.id if user else 0
 
-    # Se quiser permitir /start até para não liberados, remova esta checagem.
     if not _usuario_autorizado(uid):
         return await update.message.reply_text(
             "⛔ Acesso não autorizado.\n"
             "Use /meuid e envie seu ID ao administrador para liberação."
         )
 
-    # Menu para usuário comum
     if not _is_admin(uid):
         return await update.message.reply_text(
             "✅ Oráculo Lotofácil — Preset Mestre\n\n"
@@ -308,19 +353,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/meuid — mostra seu ID\n"
         )
 
-    # Menu para ADMIN (somente admin vê isto)
     return await update.message.reply_text(
         "✅ Oráculo Lotofácil — Preset Mestre (ADMIN)\n\n"
         "Comandos:\n"
         "/gerar — gera 10 apostas (determinístico)\n"
-        "/regerar — regenera o mesmo lote da base atual\n"
+        "/regerar — gera VARIANTE auditável (seed muda por regen_id)\n"
         "/status — status do sistema\n"
         "/meuid — mostra seu ID\n\n"
         "Admin:\n"
         "/confirmar <15 dezenas>\n"
         "/resultado <15 dezenas>\n"
     )
-
 
 async def meuid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -343,9 +386,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg.append("📌 Status — Oráculo Lotofácil (Mestre)")
     msg.append(f"Último resultado: {_format_aposta(last) if last else '(histórico vazio)'}")
     msg.append(f"Alpha: {learn.get_alpha():.3f}")
-    msg.append(f"Auto-alert: {AUTO_ALERT_ON_NEW_RESULT} | Auto-train: {AUTO_TRAIN_ON_NEW_RESULT} | Intervalo: {RESULT_CHECK_INTERVAL_SEC}s")
+    msg.append(
+        f"Auto-alert: {AUTO_ALERT_ON_NEW_RESULT} | Auto-train: {AUTO_TRAIN_ON_NEW_RESULT} | Intervalo: {RESULT_CHECK_INTERVAL_SEC}s"
+    )
     msg.append(f"Last-seen set: {'SIM' if last_seen else 'NÃO'}")
     msg.append(f"Último lote em memória: {len(LAST_APOSTAS) if LAST_APOSTAS else 0}")
+    msg.append(f"Último RegenID em memória: {LAST_REGEN_ID}")
 
     if _is_admin(uid):
         bias = learn.get_bias_num() or {}
@@ -377,7 +423,8 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = EngineConfig(overlap_max=ENGINE_OVERLAP_MAX, target_qtd=ENGINE_TARGET_QTD)
     engine = OraculoEngine(config=cfg, alpha=learn.get_alpha(), bias_num=learn.get_bias_num())
 
-    seed = deterministic_seed(base)
+    regen_id = 0
+    seed = deterministic_seed_variant(base, regen_id)
 
     try:
         apostas = engine.gerar_lote(ultimo_resultado=base, qtd=ENGINE_TARGET_QTD, seed=seed)
@@ -390,8 +437,8 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not apostas or len(apostas) != ENGINE_TARGET_QTD:
         return await update.message.reply_text("⚠️ Não foi possível gerar o lote completo dentro das regras.")
 
-    _save_last_batch(apostas, base, seed)
-    _append_audit("gerar", {"user_id": uid, "seed": seed, "base": base, "qtd": len(apostas)})
+    _save_last_batch(apostas, base, seed, regen_id=regen_id)
+    _append_audit("gerar", {"user_id": uid, "seed": seed, "regen_id": regen_id, "base": base, "qtd": len(apostas)})
 
     try:
         learn.registrar_lote_gerado(base=base, apostas=apostas, tag="gerar")
@@ -406,35 +453,8 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     linhas = []
     linhas.append("🎰 SUAS APOSTAS INTELIGENTES — Preset Mestre 🎰")
     linhas.append(f"Base: {_format_aposta(base)}")
+    linhas.append(f"RegenID: {regen_id} (canônico)")
     linhas.append(f"Seed determinístico: {seed}")
-        # Resumo do portfólio (anti-colapso)
-    if SHOW_PORTFOLIO_SUMMARY:
-    # Resumo do portfólio (anti-colapso): cobertura do complemento + overlaps
-        try:
-            universo = set(range(1, 26))
-            comp = sorted(list(universo - set(base)))  # 10 ausentes do último resultado
-            cov_comp = set()
-            for a in apostas:
-                cov_comp |= (set(a) & set(comp))
-            missing = sorted(list(set(comp) - cov_comp))
-
-            # overlaps
-            max_ov = 0
-            min_ov = 99
-            for i in range(len(apostas)):
-                for j in range(i + 1, len(apostas)):
-                    ov = len(set(apostas[i]) & set(apostas[j]))
-                    max_ov = max(max_ov, ov)
-                    min_ov = min(min_ov, ov)
-            if min_ov == 99:
-                min_ov = 0
-
-            linhas.append(f"🧩 Cobertura do complemento (10 ausentes): {len(cov_comp)}/10" + (f" | Faltando: {_format_aposta(missing)}" if missing else " | ✅ Completo"))
-            linhas.append(f"🧷 Overlap entre apostas: min={min_ov} | max={max_ov} (hard≤{engine.config.overlap_max})")
-            linhas.append("")
-        except Exception:
-            pass
-
     linhas.append("")
 
     for i, a in enumerate(apostas, 1):
@@ -443,11 +463,10 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         r = len(set(a) & set(base))
         hit = _placar(a, base)
         linhas.append(f"Aposta {i}: {_format_aposta(a)}")
-        if SHOW_BET_DETAILS:
-            linhas.append(
-                f"🔢 Pares: {pares} | Ímpares: {imp} | SeqMax: {seq} | {r}R | "
-                f"{hit} acertos (vs. último) | {'✅ OK' if shape_ok_mestre(a) else '🛠️ REVER'}"
-            )
+        linhas.append(
+            f"🔢 Pares: {pares} | Ímpares: {imp} | SeqMax: {seq} | {r}R | "
+            f"{hit} acertos (vs. último) | {'✅ OK' if shape_ok_mestre(a) else '🛠️ REVER'}"
+        )
         linhas.append("")
 
     return await update.message.reply_text("\n".join(linhas))
@@ -467,24 +486,52 @@ async def regerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not base:
         return await update.message.reply_text("⚠️ Histórico vazio ou inválido.")
 
+    partes = (update.message.text or "").strip().split()
+    forced_regen: Optional[int] = None
+    if len(partes) >= 2:
+        try:
+            forced_regen = int(partes[1])
+            if forced_regen < 0:
+                forced_regen = 0
+        except Exception:
+            forced_regen = None
+
+    base_sig = _sig_from_dezenas(base)
+
+    state = _load_regen_state()
+    current = int(state.get(base_sig, 0))
+
+    if forced_regen is None:
+        regen_id = current + 1
+    else:
+        regen_id = forced_regen
+
+    state[base_sig] = int(regen_id)
+    _save_regen_state(state)
+
     learn = LearningCore(LearnConfig(state_path=LEARN_STATE_PATH))
     cfg = EngineConfig(overlap_max=ENGINE_OVERLAP_MAX, target_qtd=ENGINE_TARGET_QTD)
     engine = OraculoEngine(config=cfg, alpha=learn.get_alpha(), bias_num=learn.get_bias_num())
 
-    seed = deterministic_seed(base)
+    seed = deterministic_seed_variant(base, regen_id)
 
     try:
         apostas = engine.gerar_lote(ultimo_resultado=base, qtd=ENGINE_TARGET_QTD, seed=seed)
     except TypeError:
         apostas = engine.gerar_lote(base, qtd=ENGINE_TARGET_QTD, seed=seed)
+    except Exception as e:
+        logger.error("Erro ao regerar lote: %s", e, exc_info=True)
+        return await update.message.reply_text(f"❌ Erro ao regerar lote: {e}")
 
-    _save_last_batch(apostas, base, seed)
-    _append_audit("regerar", {"user_id": uid, "seed": seed, "base": base, "qtd": len(apostas)})
+    _save_last_batch(apostas, base, seed, regen_id=regen_id)
+    _append_audit("regerar", {"user_id": uid, "seed": seed, "regen_id": regen_id, "base": base, "qtd": len(apostas)})
 
     return await update.message.reply_text(
-        "✅ Regerado o mesmo lote da base atual.\n"
+        "✅ Regerado NOVO lote (variante auditável) da base atual.\n"
         f"Base: {_format_aposta(base)}\n"
-        f"Seed: {seed}"
+        f"RegenID: {regen_id}\n"
+        f"Seed: {seed}\n"
+        "ℹ️ Dica: use /regerar 0 para voltar ao lote canônico."
     )
 
 async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -524,15 +571,20 @@ async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("Erro no aprendizado /confirmar: %s", e, exc_info=True)
         return await update.message.reply_text(f"Erro no aprendizado: {e}")
 
-    _append_audit("confirmar", {
-        "user_id": uid,
-        "oficial": oficial,
-        "melhor": rel.get("melhor"),
-        "media": rel.get("media"),
-        "topk": rel.get("topk"),
-        "alpha_before": alpha_before,
-        "alpha_after": rel.get("alpha"),
-    })
+    _append_audit(
+        "confirmar",
+        {
+            "user_id": uid,
+            "oficial": oficial,
+            "melhor": rel.get("melhor"),
+            "media": rel.get("media"),
+            "topk": rel.get("topk"),
+            "alpha_before": alpha_before,
+            "alpha_after": rel.get("alpha"),
+            "last_base": LAST_BASE,
+            "last_regen_id": LAST_REGEN_ID,
+        },
+    )
 
     melhor = rel.get("melhor", 0)
     media = rel.get("media", 0.0)
@@ -545,6 +597,7 @@ async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Oficial: {_format_aposta(oficial)}",
         f"Melhor: {melhor} | Média: {media:.2f} | TopK: {topk:.2f}",
         f"Alpha: {alpha_before:.3f} → {alpha_after:.3f}",
+        f"Lote avaliado: Base={_format_aposta(LAST_BASE) if LAST_BASE else '(n/a)'} | RegenID={LAST_REGEN_ID}",
         "Placares: " + ", ".join(str(x) for x in placares),
     ]
     return await update.message.reply_text("\n".join(linhas))
@@ -605,12 +658,16 @@ async def resultado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 rel = learn.aprender_com_lote(oficial=oficial, apostas=LAST_APOSTAS, tag="auto_train(resultado)")
                 trained = True
-                _append_audit("auto_train", {
-                    "oficial": oficial,
-                    "melhor": rel.get("melhor"),
-                    "media": rel.get("media"),
-                    "alpha": rel.get("alpha"),
-                })
+                _append_audit(
+                    "auto_train",
+                    {
+                        "oficial": oficial,
+                        "melhor": rel.get("melhor"),
+                        "media": rel.get("media"),
+                        "alpha": rel.get("alpha"),
+                        "last_regen_id": LAST_REGEN_ID,
+                    },
+                )
             except Exception as e:
                 logger.error("Auto-train falhou: %s", e, exc_info=True)
 
@@ -623,9 +680,6 @@ async def resultado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # --------------------------- Watcher core ---------------------------
 
 async def _watch_new_result_app(app: Application) -> None:
-    """
-    Núcleo do watcher: roda 1 vez (sem depender de JobQueue).
-    """
     hist = carregar_historico(HISTORY_PATH)
     if not hist:
         return
@@ -661,19 +715,20 @@ async def _watch_new_result_app(app: Application) -> None:
             learn = LearningCore(LearnConfig(state_path=LEARN_STATE_PATH))
             try:
                 rel = learn.aprender_com_lote(oficial=last, apostas=LAST_APOSTAS, tag="auto_train(watcher)")
-                _append_audit("auto_train", {
-                    "oficial": last,
-                    "melhor": rel.get("melhor"),
-                    "media": rel.get("media"),
-                    "alpha": rel.get("alpha"),
-                })
+                _append_audit(
+                    "auto_train",
+                    {
+                        "oficial": last,
+                        "melhor": rel.get("melhor"),
+                        "media": rel.get("media"),
+                        "alpha": rel.get("alpha"),
+                        "last_regen_id": LAST_REGEN_ID,
+                    },
+                )
             except Exception as e:
                 logger.error("Auto-train watcher falhou: %s", e, exc_info=True)
 
 async def _watch_loop(app: Application) -> None:
-    """
-    Fallback quando não há JobQueue: loop asyncio.
-    """
     await asyncio.sleep(10)
     while True:
         try:
@@ -683,11 +738,6 @@ async def _watch_loop(app: Application) -> None:
         await asyncio.sleep(max(5, int(RESULT_CHECK_INTERVAL_SEC)))
 
 async def _post_init(application: Application) -> None:
-    """
-    Roda ao iniciar o app:
-    - Tenta agendar via JobQueue se existir
-    - Senão cria task asyncio (fallback)
-    """
     if RESULT_CHECK_INTERVAL_SEC <= 0:
         return
 
