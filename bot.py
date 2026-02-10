@@ -34,7 +34,7 @@ from telegram.ext import (
     filters,
 )
 
-from engine_oraculo import OraculoEngine, EngineConfig, shape_ok_mestre, paridade, max_seq
+from engine_oraculo_patched import OraculoEngine, EngineConfig, shape_ok_mestre, paridade, max_seq
 from learning import LearningCore, LearnConfig
 
 # --------------------------- Logging ---------------------------
@@ -400,6 +400,32 @@ async def gerar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     linhas.append("🎰 SUAS APOSTAS INTELIGENTES — Preset Mestre 🎰")
     linhas.append(f"Base: {_format_aposta(base)}")
     linhas.append(f"Seed determinístico: {seed}")
+    # Resumo do portfólio (anti-colapso): cobertura do complemento + overlaps
+    try:
+        universo = set(range(1, 26))
+        comp = sorted(list(universo - set(base)))  # 10 ausentes do último resultado
+        cov_comp = set()
+        for a in apostas:
+            cov_comp |= (set(a) & set(comp))
+        missing = sorted(list(set(comp) - cov_comp))
+
+        # overlaps
+        max_ov = 0
+        min_ov = 99
+        for i in range(len(apostas)):
+            for j in range(i + 1, len(apostas)):
+                ov = len(set(apostas[i]) & set(apostas[j]))
+                max_ov = max(max_ov, ov)
+                min_ov = min(min_ov, ov)
+        if min_ov == 99:
+            min_ov = 0
+
+        linhas.append(f"🧩 Cobertura do complemento (10 ausentes): {len(cov_comp)}/10" + (f" | Faltando: {_format_aposta(missing)}" if missing else " | ✅ Completo"))
+        linhas.append(f"🧷 Overlap entre apostas: min={min_ov} | max={max_ov} (hard≤{engine.config.overlap_max})")
+        linhas.append("")
+    except Exception:
+        pass
+
     linhas.append("")
 
     for i, a in enumerate(apostas, 1):
